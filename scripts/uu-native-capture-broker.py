@@ -593,7 +593,9 @@ def run(path, restore_state, duration=3600, cursor_mode='embedded', cursor_path=
             device = read_capture_request(candidate)
             monitors = display_monitors(display_socket)
             monitor = resolve_monitor(monitors, device)
-            if device and monitor is None:
+            # Without a display guardian, DISPLAY1 is the authorized Portal
+            # stream. A configured but unavailable guardian must still fail closed.
+            if device and monitor is None and (display_socket is not None or device != r'\\.\DISPLAY1'):
                 candidate.close()
                 event('connection_rejected', unknown_output=True)
                 continue

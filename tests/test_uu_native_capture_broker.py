@@ -19,6 +19,42 @@ spec.loader.exec_module(broker)
 
 
 class BrokerCleanupTests(unittest.TestCase):
+    def test_named_primary_uses_authorized_single_output_capture_only_without_display_socket(self):
+        root = Path(__file__).resolve().parents[1]
+        for options in ([], ['--missing-display'], ['--multi']):
+            with self.subTest(options=options), tempfile.TemporaryDirectory(
+                    prefix='uurb-capture-reset-test-', dir='/tmp') as temporary:
+                directory = Path(temporary)
+                endpoint = directory / 'capture.sock'
+                broker.state_tools.write_private(directory / 'restore.json', {})
+                with tempfile.TemporaryFile() as output:
+                    process = subprocess.Popen([
+                        '/usr/bin/python3', str(root / 'tests/probes/native_capture_reset_fixture.py'),
+                        str(directory), *options], stdout=output, stderr=output)
+                    try:
+                        deadline = time.monotonic() + 4
+                        while not endpoint.exists() and process.poll() is None and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        self.assertIsNone(process.poll())
+                        self.assertTrue(endpoint.exists())
+                        for number in (3, 2, 1):
+                            device = (r'\\.\DISPLAY' + str(number)).encode('ascii')
+                            request = struct.pack('<III32s', 0x43525555, 1, 0, device)
+                            accepted = number <= 2 if options == ['--multi'] else not options and number == 1
+                            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as peer:
+                                peer.settimeout(4)
+                                peer.connect(str(endpoint))
+                                peer.sendall(request)
+                                self.assertEqual(peer.recv(64), b'UURB_FIXTURE_READY' if accepted else b'')
+                    finally:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=8)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=3)
+                    self.assertEqual(process.returncode, 0)
+
     def test_cursor_backend_matches_the_compositor(self):
         for plasma, expected in ((True, 'spa'), (False, 'mutter')):
             with self.subTest(plasma=plasma), patch.object(broker, 'plasma_wayland', return_value=plasma):

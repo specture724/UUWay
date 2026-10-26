@@ -45,4 +45,5 @@ else:
                          display_socket=directory/'display.sock')
     else:
         broker.run(directory/'capture.sock',directory/'restore.json',0,'embedded',
-                   display_reset_state=directory/'reset.json' if '--targeted' in sys.argv else None)
+                   display_reset_state=directory/'reset.json' if '--targeted' in sys.argv else None,
+                   display_socket=directory/'display.sock' if '--missing-display' in sys.argv else None)
