@@ -2,7 +2,7 @@
 
 **A NetEase UU Remote Linux host for Manjaro KDE Plasma Wayland.** This repository adapts [GaryOAO/UUWay](https://github.com/GaryOAO/UUWay) to Manjaro KDE: the official Windows host runs under Wine, while KDE's screen-cast Portal, PipeWire, NVIDIA GPU encoding and native input services connect it to the Linux desktop.
 
-> This is a **host**, not a viewer. It lets another computer or phone control this Linux machine; it cannot initiate a UU remote-control session to someone else's device. Use an official UU controller on the other device.
+> This is mainly a **host**: it lets another computer or phone control this Linux machine. It can also open the UU window here to connect to other devices, pausing hosting meanwhile; see [Connecting to other computers](#connecting-to-other-computers).
 
 [简体中文](README.md) · [KDE adaptation notes](docs/manjaro-kde.md) · [AUR build and test record](docs/aur-manjaro-kde.md)
 
@@ -16,12 +16,13 @@
 | Physical-screen capture and NVIDIA H.264 encoding | Independent capture and encode/decode checks passed |
 | Pointer, keyboard and Chinese IME | Local input services and Fcitx5 add-on running; live viewer test pending |
 | Text clipboard, remote terminal and file transfer | Inherited from upstream; not fully accepted on KDE |
+| Multiple monitors | Up to 8, switchable from the viewer; each monitor is granted separately (verified with two monitors on 2026-10-26) |
 | Remote resolution/scale changes | KDE profile is read-only; change these in local System Settings |
 | UU Super Screen (Windows virtual monitor) | Unsupported; share the existing physical monitor |
 | Control at the login screen | Unsupported; a logged-in Plasma Wayland session is required |
-| Control someone else's UU device from Linux | Unsupported; UUWay is not a viewer |
+| Connect to another UU device from Linux | Supported; hosting pauses while the UU window is open (verified on 2026-10-26) |
 
-The current KDE profile requires **one active, non-mirrored, unrotated physical display**. The Wine Xvfb display runs UU internally; it is not the desktop to share. Choose the real monitor when granting permission. Multiple monitors, virtual displays and headless operation are not verified. See the [KDE adaptation notes](docs/manjaro-kde.md) for prior tests and limitations.
+The KDE profile streams **every active, non-mirrored, unrotated physical display** (up to 8; the primary is the first screen in UU). Monitors above 144 Hz are reported as 144 Hz; mirrored or rotated monitors are not streamed, and `uuway doctor` names any it leaves out. The Wine Xvfb display runs UU internally; it is not the desktop to share. Choose each real monitor as prompted when granting permission. Virtual displays and headless operation are not verified. See the [KDE adaptation notes](docs/manjaro-kde.md) for prior tests and limitations.
 
 ## Install
 
@@ -49,9 +50,13 @@ uuway setup --installer /path/to/UURemote_Setup.exe
 uuway doctor
 ```
 
-Sign in in the UU window, select the physical monitor and save permission in KDE's screen-sharing dialog, then allow the separate input/clipboard request. Input rule installation may require administrator confirmation. The package contains **neither** the UU installer nor account data. Never copy a Wine prefix, login data or Portal grant from another machine.
+Sign in in the UU window, select each monitor as prompted and save permission in KDE's screen-sharing dialog (a wrong choice is not saved; rerun `uuway setup --only portal` to choose again), then allow the separate input/clipboard request. Input rule installation may require administrator confirmation. The package contains **neither** the UU installer nor account data. Never copy a Wine prefix, login data or Portal grant from another machine.
 
-The **UUWay Console** is available from the application menu. The KDE tray starts at desktop login and can start, restart or stop the local host. Use `uuway doctor` for status or `systemctl --user status uu-native-bridge uu-native-text` for service details. Upgrade with pacman/an AUR helper, then run `uuway refresh`. Ubuntu `.deb`/`apt` commands such as `uuway update install` and `rollback` **do not apply on Manjaro**; the source `./install.sh` is not the Manjaro installer either.
+The **UUWay Console** is available from the application menu. The KDE tray starts at desktop login and can start, restart or stop the local host. Use `uuway doctor` for status or `systemctl --user status uu-native-bridge uu-native-text uu-native-display` for service details. Upgrade with pacman/an AUR helper, then run `uuway refresh`. Ubuntu `.deb`/`apt` commands such as `uuway update install` and `rollback` **do not apply on Manjaro**; the source `./install.sh` is not the Manjaro installer either.
+
+### Connecting to other computers
+
+UU allows one window per Wine prefix, and the host bridge normally holds it. To control another device from this machine, open **UU Remote (control other computers)** from the application menu, the Console overview's "连接其他电脑" card or the tray's "连接其他电脑…" item, or run `uuway open`. UUWay pauses hosting and opens the UU window; when you are done, **quit UU from its tray icon** (closing the window only hides it to the tray), and hosting resumes about 15 seconds later. Phones and other devices cannot connect to this machine meanwhile.
 
 `uuway autologin on` configures upstream's **GDM** only. It does not configure SDDM, commonly used by KDE. If you need unattended availability after reboot, assess the security implications and configure desktop auto-login separately. UUWay is offline at the login screen.
 
@@ -64,7 +69,7 @@ systemctl --user restart wireplumber.service
 uuway setup --only portal --force portal
 ```
 
-Choose the physical monitor again if asked. See the [AUR troubleshooting notes](docs/aur-manjaro-kde.md).
+Choose each physical monitor again as prompted. See the [AUR troubleshooting notes](docs/aur-manjaro-kde.md).
 
 ## Design and credits
 

@@ -25,9 +25,9 @@ class ServiceLifecycleTests(unittest.TestCase):
                     service.run(Path('/nonexistent/runtime.json'), preserve, allow)
             private.assert_not_called()
 
-    def test_plasma_never_passes_a_stale_display_socket_to_wine(self):
+    def test_plasma_passes_the_kscreen_display_socket_to_wine(self):
         def worker(*args, **kwargs):
-            self.assertIsNone(args[9])
+            self.assertEqual(args[9].name, 'display.sock')
             signal.raise_signal(signal.SIGTERM)
 
         with self.fixture(worker) as (path, launch, event, notify), \

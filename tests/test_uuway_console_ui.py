@@ -148,6 +148,91 @@ class ConsoleInteractionTests(unittest.TestCase):
             tray.items['exit'].activate()
             quit.assert_not_called()
 
+    def build_plasma(self, plasma=True):
+        with patch.object(console, "PLASMA_READONLY", plasma):
+            ui = console.Console(Gtk, GLib, Gio)
+            ui._async = self.inline
+            ui.build(self.app)
+        self.addCleanup(ui.window.destroy)
+        return ui
+
+    @staticmethod
+    def shortcut(ui, title):
+        def walk(widget):
+            if isinstance(widget, Gtk.Label) and widget.get_text() == title:
+                return True
+            return isinstance(widget, Gtk.Container) and any(walk(child) for child in widget.get_children())
+        pending = [ui.window]
+        while pending:
+            widget = pending.pop()
+            if isinstance(widget, Gtk.Button) and walk(widget):
+                return widget
+            if isinstance(widget, Gtk.Container):
+                pending.extend(widget.get_children())
+        return None
+
+    def test_open_uu_is_offered_only_on_plasma(self):
+        self.assertIsNone(self.shortcut(self.build_plasma(False), "连接其他电脑"))
+        with patch.object(console, "PLASMA_READONLY", False):
+            self.assertNotIn("control", self.make_tray().items)
+        self.assertIsNotNone(self.shortcut(self.build_plasma(), "连接其他电脑"))
+
+    def test_open_uu_runs_the_cli_and_reports_hosting_resumed(self):
+        from unittest.mock import Mock
+        ui = self.build_plasma()
+        with patch.object(console, "_cli_command", return_value=["uuway"]), \
+                patch.object(ui, "_confirm", return_value=True), \
+                patch.object(console.subprocess, "run", return_value=Mock(returncode=0)) as run:
+            self.shortcut(ui, "连接其他电脑").clicked()
+        self.assertEqual(run.call_args.args[0], ["uuway", "open"])
+        self.assertFalse(ui.uu_open)
+        self.assertIn("远控已恢复", ui.notice.get_text())
+
+    def test_open_uu_cancel_or_failure(self):
+        from unittest.mock import Mock
+        ui = self.build_plasma()
+        with patch.object(ui, "_confirm", return_value=False), patch.object(console.subprocess, "run") as run:
+            ui.open_uu()
+        run.assert_not_called()
+        failed = Mock(returncode=1, stderr="Traceback\nRuntimeError: Quit UU before opening native login", stdout="")
+        with patch.object(console, "_cli_command", return_value=["uuway"]), \
+                patch.object(ui, "_confirm", return_value=True), \
+                patch.object(console.subprocess, "run", return_value=failed):
+            ui.open_uu()
+        self.assertIn("Quit UU before opening", ui.notice.get_text())
+        self.assertFalse(ui.uu_open)
+
+    def test_tray_control_item_is_disabled_while_uu_is_open(self):
+        with patch.object(console, "PLASMA_READONLY", True):
+            tray = self.make_tray()
+        self.assertTrue(tray.items["control"].get_sensitive())
+        self.ui.uu_open = True
+        tray.update()
+        self.assertFalse(tray.items["control"].get_sensitive())
+
+    def test_title_buttons_outrank_kde_window_decorations(self):
+        decorations = Gtk.CssProvider()
+        decorations.load_from_data(b"button.titlebutton { background-image: linear-gradient(white, white); }"
+                                   b" button.titlebutton image { color: transparent; }")
+        screen = self.ui.window.get_screen()
+        Gtk.StyleContext.add_provider_for_screen(screen, decorations, console.KDE_DECORATIONS_PRIORITY)
+        self.addCleanup(Gtk.StyleContext.remove_provider_for_screen, screen, decorations)
+        settle()
+        buttons = []
+
+        def collect(widget):
+            if isinstance(widget, Gtk.Button) and widget.get_style_context().has_class("titlebutton"):
+                buttons.append(widget)
+            if isinstance(widget, Gtk.Container):
+                widget.forall(collect)
+        collect(self.ui.window.get_titlebar())
+        self.assertTrue(buttons)
+        for button in buttons:
+            context = button.get_style_context()
+            self.assertIsNone(context.get_property("background-image", context.get_state()))
+            image = button.get_child().get_style_context()
+            self.assertEqual(image.get_property("color", image.get_state()).alpha, 1)
+
     def test_auto_save_rolls_back_selection_when_write_fails(self):
         with patch.object(console, "_write_json", side_effect=OSError("fixture full disk")):
             self.ui.backend.set_active(1)

@@ -24,6 +24,7 @@ pkgbase = uuway-git
 	depends = lib32-nvidia-utils
 	depends = vulkan-icd-loader
 	depends = pipewire
+	depends = gst-plugin-pipewire
 	depends = gst-plugins-base-libs
 	depends = json-c
 	depends = libx11

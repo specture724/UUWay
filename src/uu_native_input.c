@@ -224,7 +224,7 @@ static int load_token(const char *path, char token[64])
         if (!((token[i] >= '0' && token[i] <= '9') || (token[i] >= 'a' && token[i] <= 'f'))) ok = 0;
     return ok;
 }
-static int serve_client(int fd, const char token[64])
+static int serve_client(int fd, const char token[64], const struct uurb_output_map *output_map)
 {
     uurb_x11_handshake hello;
     if (!transfer(fd, &hello, sizeof(hello), 0, 3000)) return 1;
@@ -346,13 +346,13 @@ static int serve_client(int fd, const char token[64])
         }
         struct uurb_native_events translated;
         unsigned i;
-        for (i = 0; i < request.count; ++i) if (!uurb_native_translate(&input[i], &translated)) break;
+        for (i = 0; i < request.count; ++i) if (!uurb_native_translate_mapped(&input[i], output_map, &translated)) break;
         if (i != request.count) {
             if (!response(fd, request.sequence, 0, UURB_X11_ERROR_UNSUPPORTED)) break;
             continue;
         }
         for (i = 0; i < request.count; ++i) {
-            uurb_native_translate(&input[i], &translated);
+            uurb_native_translate_mapped(&input[i], output_map, &translated);
             struct uurb_native_scroll next_scroll = scroll;
             struct uurb_input_fraction next_fraction = fraction;
             uurb_input_scale(&translated, &input_settings, &next_fraction);
@@ -388,9 +388,10 @@ static int serve_client(int fd, const char token[64])
 }
 int main(int argc, char **argv)
 {
-    /* Single-output is a required explicit scope, not a claim that arbitrary
-     * multi-monitor/DPI changes are already mapped. Launcher must enforce it. */
-    if ((argc != 8 && argc != 10 && argc != 12) || strcmp(argv[1], "--user") || strcmp(argv[3], "--token-file") ||
+    /* Single-output is a required explicit scope unless the launcher passes
+     * an output map that places every Windows monitor on the compositor axes. */
+    struct uurb_output_map output_map = {0};
+    if ((argc != 8 && argc != 10 && argc != 12 && argc != 14) || strcmp(argv[1], "--user") || strcmp(argv[3], "--token-file") ||
         strcmp(argv[5], "--seconds") || strcmp(argv[7],
 #ifdef UURB_INPUT_EIS
         "--mapped-output"
@@ -399,6 +400,12 @@ int main(int argc, char **argv)
 #endif
         )) return 2;
     for (int i = 8; i < argc; i += 2) {
+#ifndef UURB_INPUT_EIS
+        if (!strcmp(argv[i], "--output-map") && !output_map.count) {
+            if (!uurb_output_map_parse(argv[i+1], &output_map)) return 2;
+            continue;
+        }
+#endif
         if (argv[i+1][0] != '/') return 2;
         if (!strcmp(argv[i], "--text-socket") && !text_socket) text_socket = argv[i+1];
         else if (!strcmp(argv[i], "--settings-file") && !settings_path) settings_path = argv[i+1];
@@ -486,15 +493,19 @@ int main(int argc, char **argv)
 #ifdef UURB_INPUT_EIS
            "\"backend\":\"eis\",\"mapped_absolute_input\":true}\n",
 #else
-           "\"single_output_only\":true}\n",
+           "\"single_output_only\":true,\"mapped_outputs\":%u}\n",
 #endif
-           ntohs(address.sin_port), (unsigned)uid); fflush(stdout);
+           ntohs(address.sin_port), (unsigned)uid
+#ifndef UURB_INPUT_EIS
+           , output_map.count
+#endif
+           ); fflush(stdout);
     result = 0;
     while (!stopping && now_ms() < lifetime) {
         if (!wait_io(listener, POLLIN, now_ms() + 250)) continue;
         int client = accept4(listener, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (client < 0) continue;
-        int ok = serve_client(client, token);
+        int ok = serve_client(client, token, &output_map);
         close(client);
         int released_keys = release_device(keyboard_fd, keys);
         int released_buttons = release_device(mouse_fd, buttons);

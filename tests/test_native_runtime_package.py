@@ -573,7 +573,7 @@ class PackageIsolationTests(unittest.TestCase):
                                   preserve_display_session=False)
                 self.assertFalse(installer.existing_display_policy(main.read_text()))
 
-    def test_kde_service_has_no_mutter_dependency_or_display_write_permission(self):
+    def test_kde_service_enumerates_outputs_without_display_write_permission(self):
         spec=importlib.util.spec_from_file_location('kde_installer', ROOT/'scripts/install-uu-native-service.py')
         installer=importlib.util.module_from_spec(spec);spec.loader.exec_module(installer)
         with tempfile.TemporaryDirectory() as temporary:
@@ -590,10 +590,12 @@ class PackageIsolationTests(unittest.TestCase):
                                       preserve_display_session=True, kde_readonly=True)
             units=root/'.config/systemd/user'
             bridge=(units/'uu-native-bridge.service').read_text()
-            self.assertNotIn('uu-native-display.service', bridge)
+            # The KScreen display service lists every output for UU; writes stay off.
+            self.assertIn('Wants=uu-native-display.service', bridge)
+            self.assertIn('After=uu-native-display.service', bridge)
             self.assertNotIn('--allow-display-reconfigure', bridge)
             self.assertNotIn('@DISPLAY_', bridge)
-            self.assertFalse((units/'uu-native-display.service').exists())
+            self.assertTrue((units/'uu-native-display.service').exists())
 
     def test_managed_display_policy_does_not_guess_from_comments_or_unknown_options(self):
         spec = importlib.util.spec_from_file_location('policy_installer', ROOT/'scripts/install-uu-native-service.py')

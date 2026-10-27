@@ -12,10 +12,37 @@ import socket
 import stat
 import struct
 import time
-from native_display_config import MutterDisplay
+from desktop_backend import plasma_wayland
 from native_display_guardian import DisplayRouter
 from native_runtime_state import read_private, notify
-from native_virtual_display import VirtualDisplays, VirtualSelectedDisplay, recover_layout
+
+
+def mutter_services(config, parent):
+    from native_display_config import MutterDisplay
+    from native_virtual_display import VirtualDisplays, VirtualSelectedDisplay, recover_layout
+    recover_layout(config)
+    backend = MutterDisplay()
+    manifest = read_private(Path(config['bundle']) / 'manifest.json')
+    virtual = VirtualDisplays(backend, Path(config['bundle']) / 'capture/uu-pipewire-native-probe',
+                              enabled=manifest.get('contract', {}).get('virtual_display_emulation') is True)
+    virtual.recovery_path = parent / 'virtual-layout-recovery.json'
+    guardian = DisplayRouter(backend, parent,
+        selected_factory=lambda connector: VirtualSelectedDisplay(connector, virtual))
+    return backend, virtual, guardian
+
+
+def kscreen_services(parent):
+    from native_display_kscreen import KScreenDisplay, SelectedKScreenDisplay, UnavailableVirtualDisplays
+    backend = KScreenDisplay()
+    return backend, UnavailableVirtualDisplays(), DisplayRouter(backend, parent,
+                                                                selected_factory=SelectedKScreenDisplay)
+
+
+def recover(config):
+    # KScreen changes are never written, so Plasma has no layout to restore.
+    if not plasma_wayland():
+        from native_virtual_display import recover_layout
+        recover_layout(config)
 
 
 def run(config_path):
@@ -56,14 +83,10 @@ def run(config_path):
             if (current.st_dev, current.st_ino) != (old.st_dev, old.st_ino):
                 raise RuntimeError('Display endpoint changed during recovery')
             endpoint.unlink()
-        recover_layout(config)
-        backend = MutterDisplay()
-        manifest = read_private(Path(config['bundle']) / 'manifest.json')
-        virtual = VirtualDisplays(backend, Path(config['bundle']) / 'capture/uu-pipewire-native-probe',
-                                  enabled=manifest.get('contract', {}).get('virtual_display_emulation') is True)
-        virtual.recovery_path = parent / 'virtual-layout-recovery.json'
-        guardian = DisplayRouter(backend, parent,
-            selected_factory=lambda connector: VirtualSelectedDisplay(connector, virtual))
+        if plasma_wayland():
+            backend, virtual, guardian = kscreen_services(parent)
+        else:
+            backend, virtual, guardian = mutter_services(config, parent)
         guardian.expire()
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
         listener.bind(str(endpoint)); endpoint.chmod(0o600); bound = endpoint.lstat()
@@ -200,7 +223,7 @@ if __name__ == '__main__':
     try:
         arguments = parser.parse_args()
         if arguments.recover:
-            recover_layout(read_private(arguments.config))
+            recover(read_private(arguments.config))
         else:
             run(arguments.config)
     except Exception as error:

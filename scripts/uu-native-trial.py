@@ -828,6 +828,8 @@ def run(prefix, bundle, restore_state, state_parent, duration, with_input=False,
                         str(directory / 'uu-native-input'), '--user', pwd.getpwuid(os.getuid()).pw_name,
                         '--token-file', str(directory / 'input.token'), '--seconds', str(0 if continuous else min(duration + 60, 3600)),
                         '--single-output', *(['--text-socket', str(text_socket)] if text_socket is not None else []),
+                        # KDE: place each Windows monitor on KWin's absolute axes.
+                        *(['--output-map', topology['input_map']] if 'input_map' in topology else []),
                         *(['--settings-file', str(Path.home() / '.config/uurb/input-settings.json')]
                           if verified.get('native_input_settings_included') else [])],
                         stdin=subprocess.PIPE if password is not None else subprocess.DEVNULL,

@@ -115,13 +115,12 @@ def install(bundle, prefix, restore_state, state_parent, text_socket, cursor_mod
         raise ValueError('Unsupported service installation path')
     trial.state_tools.write_private(config_path, config)
     for unit in units:
-        if kde_readonly and unit.name == 'uu-native-display.service':
-            continue
         content = (ROOT / 'systemd' / (unit.name + '.in')).read_text().replace('@ROOT@', roots[unit].replace('%', '%%'))
         content = content.replace('@DISPLAY_POLICY@', ' --preserve-display-session' if preserve_display_session else '')
         if unit.name == 'uu-native-bridge.service':
-            content = (content.replace('@DISPLAY_WANTS@', '' if kde_readonly else 'Wants=uu-native-display.service')
-                              .replace('@DISPLAY_AFTER@', '' if kde_readonly else 'After=uu-native-display.service')
+            # KDE's display service only enumerates outputs; it cannot apply modes.
+            content = (content.replace('@DISPLAY_WANTS@', 'Wants=uu-native-display.service')
+                              .replace('@DISPLAY_AFTER@', 'After=uu-native-display.service')
                               .replace('@DISPLAY_RECONFIGURE@', '' if kde_readonly else ' --allow-display-reconfigure'))
         fd, temporary = tempfile.mkstemp(prefix='.uurb-service-', dir=unit_dir)
         try:
@@ -131,8 +130,7 @@ def install(bundle, prefix, restore_state, state_parent, text_socket, cursor_mod
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
-    print(json.dumps(dict(event='native_service_staged', units=[str(unit) for unit in units
-                          if not kde_readonly or unit.name != 'uu-native-display.service'], release_id=verified['release_id'],
+    print(json.dumps(dict(event='native_service_staged', units=[str(unit) for unit in units], release_id=verified['release_id'],
                           active_service_changed=False, system_permissions_changed=False)))
 
 
@@ -144,7 +142,8 @@ if __name__ == '__main__':
                         help='Keep the saved cursor mode when omitted (fresh install: metadata)')
     parser.add_argument('--preserve-display-session', action=argparse.BooleanOptionalAction, default=None,
                         help='Keep the installed main-unit policy when omitted; explicit enable requires geometry support')
-    parser.add_argument('--kde-readonly', action='store_true', help='KDE: disable unsupported display guardian and remote mode writes')
+    parser.add_argument('--kde-readonly', action='store_true',
+                        help='KDE: read-only output enumeration without remote mode writes')
     parser.add_argument('--backend', choices=('nvidia', 'amd'),
                         help='Persist the selected GPU backend in the user runtime config')
     args = parser.parse_args()

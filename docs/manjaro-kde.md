@@ -1,9 +1,12 @@
 # Manjaro KDE Wayland (experimental)
 
-The native input/capture worker can read a **single, active, unmirrored, unrotated**
-Plasma output via `kscreen-doctor -j`. The KDE service profile never starts the
-Mutter display guardian and does not grant remote display-mode writes. Change
-resolution/scale locally in System Settings. Portal permission and native GPU
+The native input/capture worker streams **every active, unmirrored, unrotated**
+Plasma output (up to 8) read via `kscreen-doctor -j`. On KDE the display service
+is read-only (`native_display_kscreen.py`): it reports the outputs to UU's
+Windows display shim, each captured through its own saved Portal grant, and
+refuses mode, scale and layout writes; Super Screen is unavailable. Absolute
+input is remapped from the Windows layout onto each output's share of KWin's
+uinput axes. Change resolution/scale locally in System Settings. Portal permission and native GPU
 capture have been verified on this host. The actual UU session displayed the
 desktop; it still needs a manual retest after the cursor stability fix. This
 is not a supported release target.
@@ -43,7 +46,7 @@ kscreen-doctor -j
 nvidia-smi -L
 ```
 
-The doctor accepts KDE Wayland and checks the active output. It also reports
+The doctor accepts KDE Wayland and lists the streamed outputs, naming any mirrored or rotated ones it leaves out. It also reports
 missing Wine, NVENC libraries, uinput permissions, portal consent, and services.
 `./install.sh` deliberately stops before apt on Manjaro. The `.deb` release and
 `uuway update install/rollback` use dpkg/apt and must not be installed here.
@@ -188,7 +191,7 @@ was restarted; the independent text service retained its live authorization.
 
 Keep selecting the **physical screen** for desktop sharing. The private Xvfb
 display holds UU's own Windows UI; it is not the remote desktop source. Adding
-a KDE virtual output is outside this single-output input/display profile and
+a KDE virtual output is outside this physical-output input/display profile and
 does not address the Wine runtime-path error.
 
 The following manual test displayed the desktop, but mouse movement repeatedly

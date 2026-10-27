@@ -87,6 +87,40 @@ def save_restore_token(path, token):
             os.unlink(temporary)
 
 
+def expected_output_position(connector, state):
+    """KScreen logical position of one enabled output that no other output shares."""
+    outputs = [item for item in state.get('outputs', []) if isinstance(item, dict) and item.get('enabled') is True]
+    target = next((item for item in outputs if item.get('name') == connector), None)
+    if target is None:
+        raise RuntimeError(f'{connector} is not an enabled KDE output')
+    position = (target['pos']['x'], target['pos']['y'])
+    if sum((item['pos']['x'], item['pos']['y']) == position for item in outputs) != 1:
+        raise RuntimeError(f'{connector} is mirrored and cannot be told apart in screen sharing')
+    return position
+
+
+def stream_output(properties, state):
+    """The KScreen output a granted stream shares, told apart by its logical position."""
+    shared = properties.get('position')
+    if shared is None:
+        raise RuntimeError('Screen sharing did not report which screen it shares')
+    outputs = [item for item in state.get('outputs', []) if isinstance(item, dict) and item.get('enabled') is True]
+    matches = [item['name'] for item in outputs if (item['pos']['x'], item['pos']['y']) == tuple(shared)]
+    if len(matches) != 1:
+        raise RuntimeError('Screen sharing did not share exactly one identifiable KDE output')
+    return matches[0]
+
+
+def check_stream_output(properties, connector, position):
+    # The portal reports each stream's logical desktop position; that is the
+    # only stream property that ties a granted screen to a KScreen output.
+    shared = properties.get('position')
+    if shared is None:
+        raise RuntimeError('Screen sharing did not report which screen it shares')
+    if tuple(shared) != position:
+        raise RuntimeError(f'Screen sharing selected another screen; choose {connector}')
+
+
 def color_centroid(pixels, channel):
     width, height = 192, 108
     if not isinstance(pixels, (bytes, bytearray)) or len(pixels) != width * height * 3 or channel not in (0, 1, 2):
@@ -237,6 +271,10 @@ def main():
                       help='Explicit private inherited seqpacket FD for GPU frames; no local encoding')
     parser.add_argument('--restore-state', type=Path,
                         help='Opt-in private file for this probe’s own portal restore token')
+    parser.add_argument('--expect-output',
+                        help='KDE: refuse a grant for any screen but this KScreen output')
+    parser.add_argument('--identify-output', action='store_true',
+                        help='KDE: report which KScreen output the restored grant shares')
     parser.add_argument('--check-color-fixture', action='store_true',
                         help='Require the separately displayed RGB motion target in the decoded sample')
     args = parser.parse_args()
@@ -275,6 +313,15 @@ def main():
                 relay.getpeername()
         except OSError:
             parser.error('--gpu-relay-fd requires a connected inherited socket')
+    if args.expect_output is not None and (args.restore_state is None or args.source != 'monitor'):
+        parser.error('--expect-output requires --restore-state and a monitor source')
+    if args.identify_output and (args.restore_state is None or args.source != 'monitor' or
+                                 args.expect_output is not None):
+        parser.error('--identify-output requires --restore-state, a monitor source and no --expect-output')
+    expected_position = None
+    if args.expect_output is not None:
+        from desktop_backend import plasma_state
+        expected_position = expected_output_position(args.expect_output, plasma_state())
     restore_token = load_restore_token(args.restore_state) if args.restore_state else None
     from gi.repository import Gio, GLib
     binary = ROOT / 'build/native-presenter' / (
@@ -360,17 +407,33 @@ def main():
         request('SelectSources', '(oa{sv})', (session,), selection)
         notice = ('硬件编码样本仅用于匿名临时解码校验，不持久保存或上传画面。' if args.encode else
                   '仅检查帧到达情况/缓冲元数据，不保存画面。')
+        if args.expect_output is not None:
+            notice = f'请只选择显示器 {args.expect_output}。' + notice
         if args.snapshot:
             notice = '本次显式保存一张私有 PNG 用于本机界面诊断，不保存录像或上传画面。'
         print('如出现授权窗口，请选择并允许共享屏幕；' + notice, file=sys.stderr, flush=True)
         start_time = time.monotonic()
         started = request('Start', '(osa{sv})', (session, ''), {})
         start_ms = round((time.monotonic() - start_time) * 1000)
+        streams = started.get('streams', [])
+        if expected_position is not None and len(streams) == 1:
+            try:
+                check_stream_output(streams[0][1], args.expect_output, expected_position)
+            except RuntimeError:
+                # The rotated token now grants another screen. Drop the old
+                # one too, so setup asks for this output again.
+                args.restore_state.unlink(missing_ok=True)
+                raise
         # Save a freshly issued token immediately: a capture failure must not
         # discard/roll back the portal's rotated capability. Never print it.
         if args.restore_state and started.get('restore_token'):
             save_restore_token(args.restore_state, started['restore_token'])
-        streams = started.get('streams', [])
+        shared_output = None
+        if args.identify_output and len(streams) == 1:
+            # Identify only after saving: the rotated token stays usable even
+            # when no single output can be named.
+            from desktop_backend import plasma_state
+            shared_output = stream_output(streams[0][1], plasma_state())
         if len(streams) != 1 or not 0 < streams[0][0] <= 0xffffffff:
             raise RuntimeError('Expected exactly one authorized screen stream')
         if streams[0][1].get('source_type') != source_type:
@@ -432,6 +495,8 @@ def main():
                       uu_session_tested=False, physical_session_expected='wayland', cursor_mode=args.cursor_mode,
                       restore_requested=bool(restore_token), portal_start_ms=start_ms,
                       source_type=source_type, source_kind=args.source)
+        if shared_output is not None:
+            report['output'] = shared_output
         print(json.dumps(report, indent=2))
     finally:
         if remote_fd is not None:

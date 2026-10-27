@@ -42,10 +42,6 @@ CUDA_HEADER = (Path('/opt/cuda/include/cuda.h') if Path('/var/lib/pacman/local')
 SERVICES = ('uu-native-display', 'uu-native-text', 'uu-native-bridge')
 
 
-def desktop_services():
-    return tuple(name for name in SERVICES if name != 'uu-native-display' or not plasma_wayland())
-
-
 GDM_CONFIGS = (Path('/etc/gdm3/custom.conf'), Path('/etc/gdm/custom.conf'))  # Debian/Ubuntu, Fedora/Arch
 AUTOLOGIN_KEYS = ('AutomaticLoginEnable', 'AutomaticLogin')
 TIMED_KEYS = ('TimedLoginEnable', 'TimedLogin', 'TimedLoginDelay')
@@ -538,11 +534,29 @@ def open_uu(ctx):
                                 start_new_session=True)
 
 
+def open_plasma(ctx):
+    """UU allows one window per prefix, so hosting pauses while the desktop window is open."""
+    hosting = unit_active(ctx, 'uu-native-bridge')
+    if hosting:
+        info('暂停被控服务；从 UU 托盘退出后自动恢复。')
+        ctx.run(['systemctl', '--user', 'stop', 'uu-native-bridge.service'])
+    try:
+        bundle = package_bundle(ctx)
+        ctx.run([PYTHON, ROOT / 'scripts/uu-native-login.py', '--prefix', ctx.prefix,
+                 '--bundle', bundle, '--state-parent', ctx.state_dir, '--until-quit'])
+    finally:
+        if hosting:
+            ctx.run(['systemctl', '--user', 'start', 'uu-native-bridge.service'])
+
+
 def command_open(args):
     ctx = Context(args)
     if not ctx.server_exe.is_file():
         raise SetupError('UU 尚未安装，请先运行 uuway-amd setup。')
-    open_uu(ctx)
+    if plasma_wayland():
+        open_plasma(ctx)
+    else:
+        open_uu(ctx)
 
 
 def prefix_run(ctx):
@@ -693,32 +707,94 @@ def fcitx_run(ctx):
 
 # --------------------------------------------------------------------- step: portal
 
-def portal_done(ctx):
+def has_token(path):
     try:
-        has_token = ctx.restore_state.stat().st_size > 0
+        return path.stat().st_size > 0
     except OSError:
-        has_token = False
-    return has_token and not getattr(ctx.args, 'regrant_screen', False)
+        return False
+
+
+def kde_output_grants(ctx):
+    """(connector, restore file) for every output KDE streams, primary first."""
+    from desktop_backend import output_restore_state, plasma_layout, plasma_state
+    return [(item['connector'], output_restore_state(ctx.restore_state, item['connector']))
+            for item in plasma_layout(plasma_state())['monitors']]
+
+
+def portal_done(ctx):
+    if getattr(ctx.args, 'regrant_screen', False):
+        return False
+    if plasma_wayland():
+        return all(has_token(path) for _, path in kde_output_grants(ctx))
+    return has_token(ctx.restore_state)
+
+
+def grant_screen(ctx, path, extra=()):
+    backup = None
+    if getattr(ctx.args, 'regrant_screen', False) and path.exists() and not ctx.dry_run:
+        backup = path.with_name(path.name + f'.before-{int(time.time())}')
+        path.rename(backup)
+    try:
+        ctx.run([PYTHON, ROOT / 'scripts/probe-wayland-portal.py', '--capture-check',
+                 '--restore-state', path, *extra])
+        if not ctx.dry_run and not has_token(path):
+            raise SetupError('没有保存屏幕共享授权，请重新运行并勾选「记住」。')
+    except (SetupError, OSError):
+        if backup is not None and not path.exists():
+            backup.rename(path)  # keep the working grant when the new one failed
+        raise
+
+
+def legacy_grant_output(ctx):
+    """The output the single-screen build's grant shares, or None when it cannot be told."""
+    info('正在识别旧版屏幕共享授权对应的显示器；如出现授权窗口，请选择任意一块显示器并勾选「记住」。')
+    result = ctx.run([PYTHON, ROOT / 'scripts/probe-wayland-portal.py', '--capture-check',
+                      '--restore-state', ctx.restore_state, '--identify-output'], capture=True, check=False)
+    if ctx.dry_run:
+        return None
+    try:
+        return json.loads(result.stdout).get('output') if result.returncode == 0 else None
+    except ValueError:
+        return None
+
+
+def portal_run_plasma(ctx):
+    grants = kde_output_grants(ctx)
+    regrant = getattr(ctx.args, 'regrant_screen', False)
+    missing = [(connector, path) for connector, path in grants if regrant or not has_token(path)]
+    legacy = None
+    if missing and not regrant and has_token(ctx.restore_state):
+        # The portal says which screen a restored grant shares, so the old grant
+        # is reused only for that output instead of being assumed or duplicated.
+        identified = legacy_grant_output(ctx)
+        legacy = next((item for item in missing if item[0] == identified), None)
+        if legacy:
+            ok(f'旧版授权对应 {identified}，将继续使用。')
+        else:
+            warn('无法把旧版授权对应到需要授权的显示器，将逐块重新授权。')
+    others = [item for item in missing if item != legacy]
+    if others:
+        info(f'接下来会为 {len(others)} 块显示器各授权一次屏幕共享：每次只选择提示的那块显示器，并勾选「记住」。')
+    for connector, path in others:
+        info(f'请在屏幕共享对话框里选择 {connector}。')
+        grant_screen(ctx, path, ('--expect-output', connector))
+    if legacy and not ctx.dry_run:
+        # Moved only once every other output is granted: until then a failed
+        # grant leaves the running single-screen runtime its working file. A
+        # move, never a copy, because each restore consumes the token.
+        ctx.restore_state.rename(legacy[1])
+    ok('屏幕共享已授权：' + '、'.join(connector for connector, _ in grants))
 
 
 def portal_run(ctx):
     if not ctx.dry_run:
         ctx.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    backup = None
-    if getattr(ctx.args, 'regrant_screen', False) and ctx.restore_state.exists() and not ctx.dry_run:
-        backup = ctx.restore_state.with_name(ctx.restore_state.name + f'.before-{int(time.time())}')
-        ctx.restore_state.rename(backup)
+    if plasma_wayland():
+        portal_run_plasma(ctx)
+        return
     info('接下来会检查屏幕共享：请选择一块显示器，并勾选「记住」。')
     info('运行后，UU 可切换本次 GNOME 会话的所有活动显示器，包括之后创建的超级屏。')
-    try:
-        ctx.run([PYTHON, ROOT / 'scripts/probe-wayland-portal.py', '--capture-check',
-                 '--restore-state', ctx.restore_state])
-        if not ctx.dry_run and not (ctx.restore_state.is_file() and ctx.restore_state.stat().st_size):
-            raise SetupError('没有保存屏幕共享授权，请重新运行并勾选「记住」。')
-    except (SetupError, OSError):
-        if backup is not None and not ctx.restore_state.exists():
-            backup.rename(ctx.restore_state)  # keep the working grant when the new one failed
-        raise
+    grant_screen(ctx, ctx.restore_state)
     ok('屏幕共享已授权')
 
 
@@ -743,7 +819,7 @@ def package_bundle(ctx):
 
 
 def runtime_units_current(ctx):
-    for name in desktop_services():
+    for name in SERVICES:
         try:
             text = (ctx.unit_dir / (name + '.service')).read_text()
         except OSError:
@@ -842,10 +918,10 @@ def runtime_run(ctx):
         if not plasma_wayland():
             command += ['--preserve-display-session']
     if plasma_wayland():
+        # KDE's display service only enumerates outputs, so the GNOME-oriented
+        # display write policy is explicitly turned off.
         command += ['--kde-readonly', '--no-preserve-display-session']
     ctx.run(command)
-    if plasma_wayland() and (ctx.unit_dir / 'uu-native-display.service').is_file():
-        ctx.run(['systemctl', '--user', 'disable', '--now', 'uu-native-display.service'])
     # Wine's Linux path view is applied while the bridge is stopped, and the short-lived
     # wineserver the registry update starts is reaped before the bridge's Wine starts.
     ctx.run([PYTHON, ROOT / 'scripts/configure-uu-wine-mappings.py', '--prefix', ctx.prefix,
@@ -869,7 +945,7 @@ def runtime_run(ctx):
 # --------------------------------------------------------------------- step: start
 
 def start_done(ctx):
-    return not ctx.restart_bridge and all(unit_active(ctx, name) for name in desktop_services())
+    return not ctx.restart_bridge and all(unit_active(ctx, name) for name in SERVICES)
 
 
 def restart_services_confirmed(ctx):
@@ -886,12 +962,12 @@ def restart_services_confirmed(ctx):
 
 
 def start_run(ctx):
-    ctx.run(['systemctl', '--user', 'enable', '--now', *(name + '.service' for name in desktop_services())])
+    ctx.run(['systemctl', '--user', 'enable', '--now', *(name + '.service' for name in SERVICES)])
     if ctx.restart_bridge:
         if getattr(ctx.args, 'restart_services', False) and restart_services_confirmed(ctx):
-            ctx.run(['systemctl', '--user', 'restart', *(name + '.service' for name in desktop_services() if name != 'uu-native-bridge')])
+            ctx.run(['systemctl', '--user', 'restart', *(name + '.service' for name in SERVICES if name != 'uu-native-bridge')])
         elif not ctx.dry_run:
-            info(('文字服务' if plasma_wayland() else '文字与显示服务') +
+            info('文字与显示服务' +
                  '保持运行，不会被隐式重启（会丢失剪贴板所有权）；空闲时可用 uuway refresh --restart-services 重启。')
         ctx.run(['systemctl', '--user', 'restart', 'uu-native-bridge.service'])
     else:
@@ -1281,6 +1357,10 @@ def command_refresh(args):
         return 1
     with setup_lock(ctx):
         steps = set(REFRESH_STEPS)
+        if plasma_wayland():
+            # Each KDE output needs its own grant before the bridge is stopped,
+            # including on an upgrade from the single-screen build.
+            steps.add('portal')
         if ROOT.resolve() == DEB_ROOT:
             # Remove a source install's immutable per-user menu entry, which
             # otherwise shadows the console delivered by each package update.
@@ -1303,13 +1383,26 @@ def command_doctor(args):
     check('ok' if session == 'wayland' and ('GNOME' in desktop or plasma_wayland()) else 'fail', 'Wayland 桌面会话',
           f'{session or "?"} / {desktop or "?"}')
     if plasma_wayland():
+        # The probe distinguishes a broken kscreen-doctor from a layout with
+        # nothing Windows can show, and names outputs left out of the stream.
         topology = ctx.probe(['kscreen-doctor', '-j'])
-        try:
-            from desktop_backend import plasma_topology
-            plasma_topology(json.loads(topology.stdout))
-            check('ok', 'KDE 单显示器拓扑（远程修改显示模式不可用）')
-        except (ValueError, TypeError, RuntimeError):
-            check('fail', 'KDE 单显示器拓扑', 'kscreen-doctor -j 不可用或当前显示器布局不受支持')
+        enabled = shown = None
+        if topology.returncode == 0:
+            with contextlib.suppress(ValueError, TypeError, AttributeError, RuntimeError):
+                parsed = json.loads(topology.stdout)
+                enabled = [item.get('name') for item in parsed.get('outputs', []) if item.get('enabled')]
+                from desktop_backend import plasma_layout
+                shown = [item['connector'] for item in plasma_layout(parsed)['monitors']]
+        if enabled is None:
+            check('fail', 'KDE 显示拓扑', 'kscreen-doctor -j 不可用或输出无法解析')
+        elif shown is None:
+            check('fail', 'KDE 显示拓扑', '没有可串流的显示器；请保持至少一台显示器未镜像、未旋转')
+        else:
+            hidden = [name for name in enabled if name not in shown]
+            check('warn' if hidden else 'ok', 'KDE 显示拓扑',
+                  f'串流 {len(shown)} 块屏：{"、".join(shown)}（主屏 {shown[0]}）'
+                  + (f'；镜像/旋转的 {"、".join(hidden)} 不会串流' if hidden else '')
+                  + '；远程修改显示模式不可用')
     gpus = ctx.probe(['nvidia-smi', '-L'])
     check('ok' if gpus.returncode == 0 else 'fail', 'NVIDIA 驱动',
           gpus.stdout.splitlines()[0] if gpus.returncode == 0 else '没有找到可用的 NVIDIA 驱动')
@@ -1368,8 +1461,17 @@ def command_doctor(args):
     check('ok' if signed_in(ctx) else 'warn', 'UU 已登录')
     check('ok' if powershell_native(ctx) else 'warn', '终端：powershell.exe 覆盖为 native')
     check('ok' if helpers_done(ctx) else 'warn', '辅助程序与终端代理已同步')
-    token = ctx.restore_state
-    check('ok' if token.is_file() and token.stat().st_size else 'warn', '屏幕共享授权', str(token))
+    if plasma_wayland():
+        try:
+            missing = [connector for connector, path in kde_output_grants(ctx) if not has_token(path)]
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            missing = None
+        check('warn' if missing is None or missing else 'ok', '屏幕共享授权（每块显示器）',
+              '无法读取显示器布局' if missing is None else
+              ('缺少：' + '、'.join(missing) + '；运行 uuway setup 补授权' if missing else str(ctx.state_dir)))
+    else:
+        token = ctx.restore_state
+        check('ok' if has_token(token) else 'warn', '屏幕共享授权', str(token))
     check('ok' if consent_done(ctx) else 'warn', '文字服务授权', str(ctx.text_token))
     config = read_json(ctx.runtime_config)
     check('ok' if config else 'fail', '服务配置', str(ctx.runtime_config))
@@ -1377,7 +1479,7 @@ def command_doctor(args):
         bundle = Path(config.get('bundle', ''))
         check('ok' if bundle.is_dir() else 'fail', '运行时目录存在', str(bundle))
         check('ok' if runtime_units_current(ctx) else 'warn', '服务单元由 UUWay 管理且指向当前安装')
-    for name in desktop_services():
+    for name in SERVICES:
         check('ok' if unit_active(ctx, name) else 'fail', f'{name} 运行中')
         for dropin in sorted((ctx.unit_dir / (name + '.service.d')).glob('*.conf')):
             check('warn', f'{name} 有 drop-in 覆盖', str(dropin))
@@ -1456,6 +1558,8 @@ def latest_known(ctx):
     if not ctx.dry_run:
         record = dict(schema=1, checked_at=int(time.time()), tag=latest.tag, version=latest.version,
                       published=latest.published, etag=latest.etag)
+        # Doctor can run before setup; the runtime requires a private state directory.
+        ctx.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         write_atomic(ctx.state_dir / 'update.json', json.dumps(record).encode(), 0o600)
     return latest
 

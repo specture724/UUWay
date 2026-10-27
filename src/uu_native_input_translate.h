@@ -5,6 +5,7 @@
 #include "x11_input_protocol.h"
 #include <linux/input.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 struct uurb_native_events {
@@ -47,7 +48,84 @@ static inline unsigned uurb_evdev_key(unsigned scan, unsigned extended, unsigned
     }
 }
 
-static inline int uurb_native_translate(const uurb_x11_input_event *in, struct uurb_native_events *out)
+/* KWin maps a uinput absolute pointer over the bounding box of every output
+ * in logical pixels, while UU addresses Windows monitors at physical size.
+ * Each entry pairs a Windows monitor rectangle with the share of the absolute
+ * axes KWin gives that output; entry 0 is the primary monitor. */
+#define UURB_OUTPUT_MAP_MAX 8u
+#define UURB_ABSOLUTE_AXIS_MAX 65535
+#define UURB_ABSOLUTE_SPAN 65536.0
+struct uurb_output_rect { int32_t x, y, width, height; };
+struct uurb_output_map {
+    unsigned count;
+    struct uurb_output_rect windows[UURB_OUTPUT_MAP_MAX], axis[UURB_OUTPUT_MAP_MAX];
+};
+/* "wx,wy,ww,wh,ax,ay,aw,ah;..." as written by desktop_backend.input_map(). */
+static inline int uurb_output_map_parse(const char *text, struct uurb_output_map *map)
+{
+    memset(map, 0, sizeof(*map));
+    while (*text) {
+        if (map->count == UURB_OUTPUT_MAP_MAX) return 0;
+        struct uurb_output_rect *w = &map->windows[map->count], *a = &map->axis[map->count];
+        int used = 0;
+        if (sscanf(text, "%d,%d,%d,%d,%d,%d,%d,%d%n", &w->x, &w->y, &w->width, &w->height,
+                   &a->x, &a->y, &a->width, &a->height, &used) != 8) return 0;
+        if (w->x < -32768 || w->x > 32767 || w->y < -32768 || w->y > 32767 ||
+            w->width < 2 || w->width > 4096 || w->height < 2 || w->height > 4096 ||
+            a->x < 0 || a->y < 0 || a->width < 1 || a->height < 1 ||
+            a->x + a->width > UURB_ABSOLUTE_AXIS_MAX + 1 || a->y + a->height > UURB_ABSOLUTE_AXIS_MAX + 1) return 0;
+        ++map->count;
+        text += used;
+        if (*text == ';') {
+            if (!*++text) return 0;
+        } else if (*text) {
+            return 0;
+        }
+    }
+    return map->count > 0;
+}
+static inline double uurb_clamp_unit(double value)
+{
+    return value < 0 ? 0 : value > 1 ? 1 : value;
+}
+/* SendInput semantics: VIRTUALDESK coordinates span the union of all
+ * monitors, otherwise the primary monitor.  The addressed pixel is found on
+ * its Windows monitor (or the nearest one) and moved to that output's share
+ * of the KWin axes. */
+static inline void uurb_output_map_apply(const struct uurb_output_map *map, int virtual_desk, int *x, int *y)
+{
+    struct uurb_output_rect area = map->windows[0];
+    if (virtual_desk) {
+        int32_t right = area.x + area.width, bottom = area.y + area.height;
+        for (unsigned i = 1; i < map->count; ++i) {
+            const struct uurb_output_rect *r = &map->windows[i];
+            if (r->x < area.x) area.x = r->x;
+            if (r->y < area.y) area.y = r->y;
+            if (r->x + r->width > right) right = r->x + r->width;
+            if (r->y + r->height > bottom) bottom = r->y + r->height;
+        }
+        area.width = right - area.x; area.height = bottom - area.y;
+    }
+    double px = area.x + *x * (double)area.width / UURB_ABSOLUTE_SPAN;
+    double py = area.y + *y * (double)area.height / UURB_ABSOLUTE_SPAN;
+    unsigned best = 0;
+    double best_distance = -1;
+    for (unsigned i = 0; i < map->count; ++i) {
+        const struct uurb_output_rect *r = &map->windows[i];
+        double dx = px < r->x ? r->x - px : px >= r->x + r->width ? px - (r->x + r->width) + 1 : 0;
+        double dy = py < r->y ? r->y - py : py >= r->y + r->height ? py - (r->y + r->height) + 1 : 0;
+        double distance = dx * dx + dy * dy;
+        if (best_distance < 0 || distance < best_distance) { best = i; best_distance = distance; }
+    }
+    const struct uurb_output_rect *w = &map->windows[best], *a = &map->axis[best];
+    double u = uurb_clamp_unit((px - w->x) / w->width), v = uurb_clamp_unit((py - w->y) / w->height);
+    int mx = (int)(a->x + u * (a->width - 1) + 0.5), my = (int)(a->y + v * (a->height - 1) + 0.5);
+    *x = mx > UURB_ABSOLUTE_AXIS_MAX ? UURB_ABSOLUTE_AXIS_MAX : mx;
+    *y = my > UURB_ABSOLUTE_AXIS_MAX ? UURB_ABSOLUTE_AXIS_MAX : my;
+}
+
+static inline int uurb_native_translate_mapped(const uurb_x11_input_event *in, const struct uurb_output_map *map,
+                                               struct uurb_native_events *out)
 {
     memset(out, 0, sizeof(*out));
     unsigned flags = in->flags;
@@ -59,10 +137,10 @@ static inline int uurb_native_translate(const uurb_x11_input_event *in, struct u
         out->keyboard = 1;
         uurb_emit(out, EV_KEY, key, !(flags & UURB_KEYEVENTF_KEYUP));
     } else if (in->type == UURB_X11_INPUT_MOUSE) {
-        /* First runtime supports one captured output. The compositor maps the
-         * full normalized absolute range; multi-output mapping must negotiate
-         * a matching topology before this backend is activated there. */
-        const unsigned move = 1, absolute = 0x8000, wheel = 0x800, hwheel = 0x1000;
+        /* Without an output map the compositor receives the normalized range
+         * unchanged, which matches only when its layout equals the Windows
+         * one. A map moves each absolute point onto its output's share. */
+        const unsigned move = 1, absolute = 0x8000, wheel = 0x800, hwheel = 0x1000, virtual_desk = 0x4000;
         const unsigned xdown = 0x80, xup = 0x100;
         if (flags & ~0xf9ffu || in->virtual_key || in->scan_code) return 0;
         if ((flags & (wheel | hwheel)) && (flags & (xdown | xup))) return 0;
@@ -76,6 +154,7 @@ static inline int uurb_native_translate(const uurb_x11_input_event *in, struct u
             if (flags & absolute) {
                 int x = in->x < 0 ? 0 : in->x > 65535 ? 65535 : in->x;
                 int y = in->y < 0 ? 0 : in->y > 65535 ? 65535 : in->y;
+                if (map && map->count) uurb_output_map_apply(map, (flags & virtual_desk) != 0, &x, &y);
                 uurb_emit(out, EV_ABS, ABS_X, x); uurb_emit(out, EV_ABS, ABS_Y, y);
             } else {
                 if (in->x < -32768 || in->x > 32767 || in->y < -32768 || in->y > 32767) return 0;
@@ -100,6 +179,10 @@ static inline int uurb_native_translate(const uurb_x11_input_event *in, struct u
     } else return 0;
     uurb_emit(out, EV_SYN, SYN_REPORT, 0);
     return 1;
+}
+static inline int uurb_native_translate(const uurb_x11_input_event *in, struct uurb_native_events *out)
+{
+    return uurb_native_translate_mapped(in, NULL, out);
 }
 
 /* Windows and evdev high-resolution wheels both use 120 units per detent.

@@ -21,7 +21,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from desktop_backend import plasma_wayland
+from desktop_backend import output_restore_state, plasma_wayland
 _spec = importlib.util.spec_from_file_location('capture_runtime_state', ROOT / 'scripts/native_runtime_state.py')
 state_tools = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(state_tools)
@@ -348,15 +348,21 @@ def producer_command(restore_state, channel, duration, cursor_mode, cursor_fd=No
         raise ValueError('Unsupported capture cursor policy')
     if (cursor_mode in ('metadata', 'composited')) != (cursor_fd is not None):
         raise ValueError('Metadata mode requires its private cursor channel')
-    if connector is not None:
+    plasma = plasma_wayland()
+    if connector is not None and not plasma:
         return direct_command(connector, channel, duration, cursor_mode, capture_binary,
                               cursor_fd, status_fd)
+    # KWin has no consent-free per-output source like Mutter's RecordMonitor:
+    # each output restores its own portal grant and must match its connector.
     command = ['/usr/bin/python3', str(ROOT / 'scripts/probe-wayland-portal.py'),
-            '--restore-state', str(restore_state), '--authorization-timeout', '10',
+            '--restore-state', str(restore_state if connector is None else output_restore_state(restore_state, connector)),
+            '--authorization-timeout', '10',
             '--gpu-relay-fd', str(channel), '--duration-seconds', str(duration),
             '--cursor-mode', cursor_mode]
+    if connector is not None:
+        command.extend(['--expect-output', connector])
     if cursor_fd is not None:
-        command.extend(['--cursor-backend', 'spa' if plasma_wayland() else 'mutter'])
+        command.extend(['--cursor-backend', 'spa' if plasma else 'mutter'])
         command.extend(['--cursor-state-fd', str(cursor_fd)])
     if status_fd is not None:
         if status_fd < 3 or status_fd in (channel, cursor_fd):
@@ -674,9 +680,16 @@ def run_multi(path, restore_state, duration=3600, cursor_mode='embedded', cursor
     producer_command(restore_state, 3, duration, cursor_mode,
                      4 if cursor_path is not None and cursor_mode in ('metadata', 'composited') else None,
                      capture_binary=capture_binary)
-    info = restore_state.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
-        raise ValueError('An existing private authorized restore-state file is required')
+    if plasma_wayland():
+        # Every KDE track restores its own output's grant from this directory;
+        # an output without one asks on the local screen when it is opened.
+        info = restore_state.parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError('A private restore-state directory is required')
+    else:
+        info = restore_state.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError('An existing private authorized restore-state file is required')
     cursor_directory = cursor_path.parent if cursor_path is not None else None
     stopping = False
     reset_pending = False

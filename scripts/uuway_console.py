@@ -39,6 +39,8 @@ SERVICE_NAMES = {
     "uu-native-text.service": "文字兼容服务",
     "uu-native-display.service": "显示保护服务",
 }
+# libwindow-decorations-gtk-module's GTK_STYLE_PROVIDER_PRIORITY_USER + 1.
+KDE_DECORATIONS_PRIORITY = 801
 PLASMA_READONLY = (os.environ.get('XDG_SESSION_TYPE') == 'wayland' and
                    'KDE' in os.environ.get('XDG_CURRENT_DESKTOP', '').split(':'))
 if PLASMA_READONLY:
@@ -170,6 +172,15 @@ def _update_command(action, *, machine=True, install=False):
     if not isinstance(value, dict):
         raise ValueError('更新工具返回了无效状态，请更新控制台')
     return value
+
+
+def _open_uu():
+    """Blocks until UU is quit from its tray; the CLI pauses and resumes hosting around it."""
+    result = subprocess.run(_cli_command() + ['open'], capture_output=True, text=True,
+                            stdin=subprocess.DEVNULL, check=False)
+    if result.returncode:
+        lines = (result.stderr or result.stdout).strip().splitlines()
+        raise ValueError(lines[-1] if lines else f'退出码 {result.returncode}')
 
 
 def _download_directory(home=None, config_home=None):
@@ -514,6 +525,7 @@ class Tray:
         for name, label, callback in (
                 ("status", "UUWay · 正在读取状态", None),
                 ("open", "打开控制台", self.present),
+                *((("control", "连接其他电脑…", self.open_uu),) if PLASMA_READONLY else ()),
                 ("start", "启动远控", lambda *_: self.action("start")),
                 ("restart", "重启远控", lambda *_: self.action("restart")),
                 ("stop", "停止远控", lambda *_: self.action("stop")),
@@ -558,6 +570,8 @@ class Tray:
         self.items["stop"].set_sensitive(not changing and self.state in ("active", "failed"))
         self.items["exit"].set_sensitive(not changing)
         self.items["tray_exit"].set_sensitive(not changing)
+        if "control" in self.items:
+            self.items["control"].set_sensitive(not changing and not self.console.uu_open)
         self.indicator.set_status(self.Indicator.IndicatorStatus.ATTENTION if self.state == "failed"
                                   else self.Indicator.IndicatorStatus.ACTIVE)
 
@@ -571,6 +585,10 @@ class Tray:
                 self.update((value or {}).get("uu-native-bridge.service", {}).get("ActiveState", "unknown"))
             self.console._async(_service_properties, done)
         return True
+
+    def open_uu(self, *_):
+        self.present()
+        self.console.open_uu()
 
     def action(self, operation, quit_after=False):
         self.present()
@@ -611,6 +629,7 @@ class Console:
         self.display_monitors = []
         self.updating_outputs = False
         self.virtual_busy = False
+        self.uu_open = False
         self.update_checking = self.update_installing = self.update_status_busy = False
         self.update_external_busy = self.update_rollback_available = False
         self.update_auto_saved = True
@@ -862,6 +881,30 @@ class Console:
                     return
             self.refresh()
         self._async(work, done)
+
+    def open_uu(self):
+        if self.uu_open or self.service_busy:
+            return
+        if not self._confirm("暂停远控并打开 UU？",
+                             "UU 一次只能打开一个窗口：使用期间手机等设备无法连接本机。"
+                             "从 UU 托盘图标退出后，远控会自动恢复。", "打开 UU"):
+            return
+        self.uu_open = True
+        if self.tray:
+            self.tray.update()
+        self.message("UU 窗口即将打开；从 UU 托盘退出后远控自动恢复。", "warning")
+
+        def done(value, error):
+            self.uu_open = False
+            if self.tray:
+                self.tray.update()
+                self.tray.refresh()
+            if error:
+                self.message(f"打开 UU 未完成：{error}", "error")
+            else:
+                self.message("UU 已退出，远控已恢复。")
+            self.refresh()
+        self._async(_open_uu, done)
 
     def _input_values(self):
         return (int(self.relative.get_value()), int(self.wheel.get_value()), self.invert.get_active())
@@ -1650,10 +1693,12 @@ class Console:
         page.pack_start(self.label("常用操作", "section-title"), False, False, 0)
         shortcuts = self.box(False, 14)
         shortcuts.set_homogeneous(True)
-        for title, hint, icon, destination in (
-                ("调整显示", "分辨率与设备封面", "video-display-symbolic", "display"),
-                ("调节手感", "鼠标与文字输入", "input-mouse-symbolic", "input"),
-                ("传送文件", "发送与接收目录", "folder-download-symbolic", "files")):
+        actions = [("调整显示", "分辨率与设备封面", "video-display-symbolic", lambda: self.navigate("display")),
+                   ("调节手感", "鼠标与文字输入", "input-mouse-symbolic", lambda: self.navigate("input")),
+                   ("传送文件", "发送与接收目录", "folder-download-symbolic", lambda: self.navigate("files"))]
+        if PLASMA_READONLY:
+            actions.append(("连接其他电脑", "打开 UU，期间暂停远控", "network-workgroup-symbolic", self.open_uu))
+        for title, hint, icon, activate in actions:
             button = self.style(self.Gtk.Button(), "shortcut")
             box = self.box(spacing=11)
             top = self.box(False)
@@ -1664,7 +1709,7 @@ class Console:
             box.pack_start(self.label(title, "row-title"), False, False, 0)
             box.pack_start(self.label(hint, "muted"), False, False, 0)
             button.add(box)
-            button.connect("clicked", lambda _, dest=destination: self.navigate(dest))
+            button.connect("clicked", lambda _, activate=activate: activate())
             shortcuts.pack_start(button, True, True, 0)
         page.pack_start(shortcuts, False, False, 0)
 
@@ -1903,8 +1948,6 @@ class Console:
             .uuway .sidebar { background: #111d31; }
             .uuway .brand { color: #ecf6fc; font-size: 22px; font-weight: 800; letter-spacing: -.7px; }
             .uuway .sidebar-footer { color: #8399b5; font-size: 10px; letter-spacing: 1px; }
-            .uuway headerbar button.titlebutton { min-height: 22px; min-width: 22px; padding: 2px; background: transparent; border-color: transparent; }
-            .uuway headerbar button.titlebutton:hover { background: #e5edf5; }
             .uuway .navigation { background: transparent; }
             .uuway .navigation row { background: transparent; border-radius: 9px; margin: 3px 12px; padding: 13px 12px; color: #a2b3ca; }
             .uuway .navigation row label, .uuway .navigation row image { color: #a2b3ca; }
@@ -1971,6 +2014,19 @@ class Console:
         """)
         self.Gtk.StyleContext.add_provider_for_screen(self.window.get_screen(), css,
                                                       self.Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        # Breeze and KDE's window-decorations GTK module paint title buttons as background images
+        # drawn for the KWin title bar (light strokes when it is dark) and hide the icons. The
+        # module loads window_decorations.css at user priority + 1 and wins ties.
+        titlebuttons = self.Gtk.CssProvider()
+        titlebuttons.load_from_data(b"""
+            .uuway headerbar button.titlebutton { min-height: 22px; min-width: 22px; padding: 2px; background: transparent; border-color: transparent; }
+            .uuway headerbar button.titlebutton:hover { background: #e5edf5; }
+            .uuway headerbar button.titlebutton image { color: #45566e; }
+            .uuway headerbar button.titlebutton.close:hover { background: #f6dede; }
+            .uuway headerbar button.titlebutton.close:hover image { color: #a45151; }
+        """)
+        self.Gtk.StyleContext.add_provider_for_screen(self.window.get_screen(), titlebuttons,
+                                                      KDE_DECORATIONS_PRIORITY + 1)
 
 
 def main(argv=None):

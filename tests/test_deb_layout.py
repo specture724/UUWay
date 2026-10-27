@@ -150,6 +150,12 @@ class CommandAndIntegrationTests(unittest.TestCase):
         self.assertIn(f"usr/share/icons/hicolor/scalable/apps/{icon}.svg", DEST.values())
         self.assertIn("StartupWMClass=io.uuway.Console", entry)
 
+    def test_control_entry_opens_uu_through_the_installed_command(self):
+        self.assertEqual(DEST["packaging/deb/uuway-control.desktop"], "usr/share/applications/uuway-control.desktop")
+        entry = (ROOT / "packaging/deb/uuway-control.desktop").read_text()
+        command = re.search(r"^Exec=(\S+) open$", entry, re.M).group(1)
+        self.assertIn(command.lstrip("/"), deb_manifest.COMMANDS)
+
 
 class MetadataTests(unittest.TestCase):
     def test_control_template_has_the_fields_stage_deb_fills(self):

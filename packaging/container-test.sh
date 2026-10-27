@@ -39,6 +39,7 @@ section "Layout"
 check "everything is root-owned and sits where it should" /usr/bin/python3 - <<'PY'
 import os, subprocess, sys
 allowed = ('/usr/lib/uuway', '/usr/bin/uuway', '/usr/bin/uuway-console', '/usr/share/doc/uuway', '/usr/share/applications/uuway.desktop',
+           '/usr/share/applications/uuway-control.desktop',
            '/usr/share/icons/hicolor/scalable/apps/uuway.svg',
            '/usr/lib/udev/rules.d/70-uurb-native-input.rules', '/usr/share/lintian/overrides/uuway')
 parents = {'/', '/usr', '/usr/bin', '/usr/lib', '/usr/share', '/usr/share/doc', '/usr/share/applications',

@@ -566,9 +566,10 @@ def run(config_path, preserve_display_session=False, allow_display_reconfigure=F
     apply_desktop_image(Path(config['prefix']), config_path.parent)
     # Expose the native display catalogue to UU so its mode list stays
     # complete.  The native bridge is read-only by default; only an explicit
-    # opt-in enables remote writes to Mutter.
+    # opt-in enables remote writes to Mutter.  KDE serves the same catalogue
+    # from KScreen and refuses every write.
     display_socket = (Path(config['state_parent']) / 'display.sock'
-                      if verified.get('native_display_included') and not plasma_wayland() else None)
+                      if verified.get('native_display_included') else None)
     preserve_display_session = bool(preserve_display_session and allow_display_reconfigure)
     backend, endpoint = text_configuration(config, config_path.parent)
     stopping = False

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=UU 远程（控制其他电脑）
+Name[en]=UU Remote (control other computers)
+Keywords=UU;UUWay;远程;Remote;
+Comment=打开 UU 窗口连接其他电脑；使用期间本机暂停被控，从 UU 托盘退出后自动恢复
+Comment[en]=Open the UU window to connect to other computers; hosting pauses until UU is quit from its tray icon
+Exec=/usr/bin/uuway open
+Icon=uuway
+Terminal=false
+Categories=Network;RemoteAccess;
+OnlyShowIn=KDE;

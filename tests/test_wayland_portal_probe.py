@@ -15,6 +15,44 @@ spec.loader.exec_module(probe)
 
 
 class WaylandPortalProbeTests(unittest.TestCase):
+    def test_a_grant_must_be_the_expected_kde_output(self):
+        state = dict(outputs=[dict(name='DP-1', enabled=True, pos=dict(x=2743, y=0)),
+                              dict(name='DP-2', enabled=True, pos=dict(x=0, y=0)),
+                              dict(name='HDMI-A-1', enabled=False, pos=dict(x=0, y=0))])
+        position = probe.expected_output_position('DP-1', state)
+        self.assertEqual(position, (2743, 0))
+        probe.check_stream_output({'position': (2743, 0), 'size': (2560, 1440)}, 'DP-1', position)
+        with self.assertRaisesRegex(RuntimeError, 'DP-1'):
+            probe.check_stream_output({'position': (0, 0)}, 'DP-1', position)
+        with self.assertRaises(RuntimeError):
+            probe.check_stream_output({'size': (2560, 1440)}, 'DP-1', position)
+        with self.assertRaisesRegex(RuntimeError, 'not an enabled'):
+            probe.expected_output_position('HDMI-A-1', state)
+        state['outputs'][0]['pos'] = dict(x=0, y=0)
+        with self.assertRaisesRegex(RuntimeError, 'mirrored'):
+            probe.expected_output_position('DP-1', state)
+
+    def test_a_restored_grant_names_the_kde_output_it_shares(self):
+        state = dict(outputs=[dict(name='DP-1', enabled=True, pos=dict(x=2743, y=0)),
+                              dict(name='DP-2', enabled=True, pos=dict(x=0, y=0)),
+                              dict(name='HDMI-A-1', enabled=False, pos=dict(x=2743, y=0))])
+        self.assertEqual(probe.stream_output({'position': (2743, 0)}, state), 'DP-1')
+        self.assertEqual(probe.stream_output({'position': (0, 0)}, state), 'DP-2')
+        for properties in ({'position': (5000, 0)}, {'size': (2560, 1440)}):
+            with self.subTest(properties=properties), self.assertRaises(RuntimeError):
+                probe.stream_output(properties, state)
+        state['outputs'][0]['pos'] = dict(x=0, y=0)
+        with self.assertRaisesRegex(RuntimeError, 'exactly one'):
+            probe.stream_output({'position': (0, 0)}, state)
+
+    def test_identify_output_needs_a_restore_state_and_excludes_expect_output(self):
+        for args in [['--identify-output'],
+                     ['--identify-output', '--restore-state', '/unused', '--expect-output', 'DP-1']]:
+            result = subprocess.run(['/usr/bin/python3', str(SCRIPT), *args],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 2, args)
+            self.assertNotIn('Portal CreateSession:', result.stderr)
+
     def test_kde_registers_installed_identity_once_before_portal_requests(self):
         from gi.repository import Gio
         bus = Mock()

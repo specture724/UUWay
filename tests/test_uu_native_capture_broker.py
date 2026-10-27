@@ -184,6 +184,23 @@ class BrokerCleanupTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             broker.producer_command(Path('/private/state.json'), 7, 0, 'embedded', capture_binary=Path('build/probe'))
 
+    def test_kde_tracks_restore_their_own_output_grant(self):
+        binary = Path('/private/release/capture/uu-pipewire-native-probe')
+        with patch.object(broker, 'plasma_wayland', return_value=True):
+            command = broker.producer_command(Path('/private/portal-probe.json'), 7, 0, 'metadata', 8,
+                                              capture_binary=binary, connector='DP-1')
+        self.assertIn('probe-wayland-portal.py', command[1])
+        self.assertEqual(command[command.index('--restore-state') + 1], '/private/portal-probe.DP-1.json')
+        self.assertEqual(command[command.index('--expect-output') + 1], 'DP-1')
+        self.assertEqual(command[command.index('--cursor-backend') + 1], 'spa')
+        with patch.object(broker, 'plasma_wayland', return_value=True), self.assertRaises(ValueError):
+            broker.producer_command(Path('/private/portal-probe.json'), 7, 0, 'embedded',
+                                    capture_binary=binary, connector='../x')
+        with patch.object(broker, 'plasma_wayland', return_value=False):
+            command = broker.producer_command(Path('/private/portal-probe.json'), 7, 0, 'embedded',
+                                              capture_binary=binary, connector='DP-1')
+        self.assertIn('mutter-direct-capture.py', command[1])
+
     def test_real_reset_retires_consumer_without_restarting_listener(self):
         root=Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(prefix='uurb-capture-reset-test-',dir='/tmp') as temporary:
