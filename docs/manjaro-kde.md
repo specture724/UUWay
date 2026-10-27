@@ -51,6 +51,24 @@ missing Wine, NVENC libraries, uinput permissions, portal consent, and services.
 `./install.sh` deliberately stops before apt on Manjaro. The `.deb` release and
 `uuway update install/rollback` use dpkg/apt and must not be installed here.
 
+## Upgrading From Single-Screen Capture
+
+After updating the package, run `uuway refresh` from the logged-in Plasma
+session. The portal step identifies which output the legacy
+`portal-probe.json` grant shares and requests grants only for other missing
+outputs. It keeps the rotated legacy token at its original path until the
+new runtime configuration has been staged successfully, then moves it to
+`portal-probe.<connector>.json`. It does not duplicate the token.
+
+A portal-only run (`uuway setup --only portal`) prepares the migration but
+leaves the old runtime's grant in place; finish with `uuway refresh`. A
+packaging failure leaves the old bridge running. If runtime staging fails
+or is interrupted, UUWay restores the prior runtime configuration and user
+units, retains the current valid grant, and restarts the bridge only if it
+was running before the switch. If automatic recovery fails, the command
+reports that failure rather than claiming the service was restored. Fix the
+reported cause and retry `uuway refresh`.
+
 ## Prerequisites for a source trial
 
 1. Obtain the official Windows UU installer yourself. The project does not ship it.

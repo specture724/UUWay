@@ -135,6 +135,7 @@ class Context:
         self.releases = self.home / '.local/share/uuway/releases'
         self.restart_bridge = False
         self.restart_display = False
+        self.pending_legacy_grant = None
 
     @property
     def app_dir(self):
@@ -725,7 +726,8 @@ def portal_done(ctx):
     if getattr(ctx.args, 'regrant_screen', False):
         return False
     if plasma_wayland():
-        return all(has_token(path) for _, path in kde_output_grants(ctx))
+        return all(has_token(path) or (path == ctx.pending_legacy_grant and has_token(ctx.restore_state))
+                   for _, path in kde_output_grants(ctx))
     return has_token(ctx.restore_state)
 
 
@@ -779,11 +781,12 @@ def portal_run_plasma(ctx):
         info(f'请在屏幕共享对话框里选择 {connector}。')
         grant_screen(ctx, path, ('--expect-output', connector))
     if legacy and not ctx.dry_run:
-        # Moved only once every other output is granted: until then a failed
-        # grant leaves the running single-screen runtime its working file. A
-        # move, never a copy, because each restore consumes the token.
-        ctx.restore_state.rename(legacy[1])
+        # Keep the rotated token at the old runtime's path until its replacement
+        # is staged. A portal-only run must not break the running single-screen build.
+        ctx.pending_legacy_grant = legacy[1]
     ok('屏幕共享已授权：' + '、'.join(connector for connector, _ in grants))
+    if ctx.pending_legacy_grant is not None:
+        info('旧版授权暂保留原位，运行时配置成功后再迁移；继续升级请运行 uuway refresh。')
 
 
 def portal_run(ctx):
@@ -832,7 +835,7 @@ def runtime_units_current(ctx):
 
 
 def runtime_done(ctx):
-    if ctx.dry_run:
+    if ctx.dry_run or ctx.pending_legacy_grant is not None:
         return False
     config = read_json(ctx.runtime_config)
     if not config or not runtime_units_current(ctx):
@@ -892,7 +895,55 @@ def ensure_backup(ctx):
     return target
 
 
+@contextlib.contextmanager
+def legacy_grant_switch(ctx):
+    """Keep the old runtime recoverable until its grant can move without duplication."""
+    target = ctx.pending_legacy_grant
+    if ctx.dry_run or target is None:
+        yield
+        return
+    files = [ctx.runtime_config, ctx.config_dir / 'text-backend.json',
+             *(ctx.unit_dir / (name + '.service') for name in SERVICES)]
+    saved = {}
+    for path in files:
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise SetupError(f'不能安全备份运行时文件：{path}')
+        saved[path] = (path.read_bytes(), path.stat().st_mode & 0o777) if path.exists() else None
+    bridge_active = unit_active(ctx, 'uu-native-bridge')
+    try:
+        yield
+        if target.exists() or target.is_symlink():
+            raise SetupError(f'逐屏授权已存在，拒绝覆盖：{target}')
+        ctx.restore_state.rename(target)
+    except (Exception, KeyboardInterrupt):
+        # Keep the live rotated capability, including an interrupt just after rename;
+        # never restore a stale token backup.
+        try:
+            if not ctx.restore_state.exists():
+                target.rename(ctx.restore_state)
+            for path, previous in saved.items():
+                if previous is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    write_atomic(path, *previous)
+            ctx.run(['systemctl', '--user', 'daemon-reload'])
+            if bridge_active:
+                ctx.run(['systemctl', '--user', 'start', 'uu-native-bridge.service'])
+        except (Exception, KeyboardInterrupt) as error:
+            raise SetupError('运行时升级失败，自动恢复也未完成；请保留现有屏幕授权文件，'
+                             '检查服务日志并运行 uuway refresh：' + str(error)) from error
+        ctx.restart_bridge = False
+        ctx.restart_display = False
+        warn('运行时升级失败，已恢复原配置；旧版屏幕授权保留在原路径。')
+        raise
+    ctx.pending_legacy_grant = None
+
+
 def runtime_run(ctx):
+    if (plasma_wayland() and ctx.pending_legacy_grant is None and has_token(ctx.restore_state)
+            and any(not has_token(path) for _, path in kde_output_grants(ctx))):
+        # Also prepare migration when retrying only the runtime step in a new process.
+        portal_run(ctx)
     ensure_backup(ctx)
     previous = read_json(ctx.runtime_config) or {}
     if not getattr(ctx, 'backend', None):
@@ -904,41 +955,41 @@ def runtime_run(ctx):
         # Reload the independent daemon on every runtime upgrade, including
         # fixes within the same virtual-display ABI. Text keeps running.
         ctx.restart_display = True
-    if unit_active(ctx, 'uu-native-bridge'):
-        info('先停止 UUWay 桥接服务，写好配置后再启动。')
-        ctx.run(['systemctl', '--user', 'stop', 'uu-native-bridge.service'])
-    ok(f'运行时：{bundle}')
-    command = [PYTHON, ROOT / 'scripts/install-uu-native-service.py', '--bundle', bundle,
-               '--prefix', ctx.prefix, '--restore-state', ctx.restore_state,
-               '--state-parent', ctx.state_dir, '--text-socket', ctx.state_dir / 'text.sock',
-               '--backend', ctx.backend]
-    if not ctx.runtime_config.exists():
-        # A re-run must keep what the console saved, so these only go in on a fresh install.
-        command += ['--cursor-mode', 'metadata']
-        if not plasma_wayland():
-            command += ['--preserve-display-session']
-    if plasma_wayland():
-        # KDE's display service only enumerates outputs, so the GNOME-oriented
-        # display write policy is explicitly turned off.
-        command += ['--kde-readonly', '--no-preserve-display-session']
-    ctx.run(command)
-    # Wine's Linux path view is applied while the bridge is stopped, and the short-lived
-    # wineserver the registry update starts is reaped before the bridge's Wine starts.
-    ctx.run([PYTHON, ROOT / 'scripts/configure-uu-wine-mappings.py', '--prefix', ctx.prefix,
-             '--config-directory', ctx.config_dir])
-    wineserver = WINE_DIR / 'wineserver'
-    ctx.run([wineserver, '-k'], env=ctx.wine_env(), check=False)
-    ctx.run([wineserver, '-w'], env=ctx.wine_env(), check=False)
-    backend_file = ctx.config_dir / 'text-backend.json'
-    if not backend_file.exists():
-        pgrep = ctx.probe(['pgrep', '-u', str(os.getuid()), '-x', 'fcitx5'])
-        backend = 'fcitx' if pgrep.returncode == 0 and fcitx_conf_path(ctx).is_file() else 'portal'
-        if ctx.dry_run:
-            info(f'（演练）会写入 {backend_file}：{backend}')
-        else:
-            write_atomic(backend_file, json.dumps(dict(version=1, backend=backend)).encode(), 0o600)
-            ok(f'手机输入法文字通道：{backend}')
-    ctx.run(['systemctl', '--user', 'daemon-reload'])
+    with legacy_grant_switch(ctx):
+        if unit_active(ctx, 'uu-native-bridge'):
+            info('先停止 UUWay 桥接服务，写好配置后再启动。')
+            ctx.run(['systemctl', '--user', 'stop', 'uu-native-bridge.service'])
+        ok(f'运行时：{bundle}')
+        command = [PYTHON, ROOT / 'scripts/install-uu-native-service.py', '--bundle', bundle,
+                   '--prefix', ctx.prefix, '--restore-state', ctx.restore_state,
+                   '--state-parent', ctx.state_dir, '--text-socket', ctx.state_dir / 'text.sock',
+                   '--backend', ctx.backend]
+        if not ctx.runtime_config.exists():
+            # A re-run must keep what the console saved, so these only go in on a fresh install.
+            command += ['--cursor-mode', 'metadata']
+            if not plasma_wayland():
+                command += ['--preserve-display-session']
+        if plasma_wayland():
+            # KDE's display service only enumerates outputs; it cannot apply modes.
+            command += ['--kde-readonly', '--no-preserve-display-session']
+        ctx.run(command)
+        # Wine's Linux path view is applied while the bridge is stopped, and the short-lived
+        # wineserver the registry update starts is reaped before the bridge's Wine starts.
+        ctx.run([PYTHON, ROOT / 'scripts/configure-uu-wine-mappings.py', '--prefix', ctx.prefix,
+                 '--config-directory', ctx.config_dir])
+        wineserver = WINE_DIR / 'wineserver'
+        ctx.run([wineserver, '-k'], env=ctx.wine_env(), check=False)
+        ctx.run([wineserver, '-w'], env=ctx.wine_env(), check=False)
+        backend_file = ctx.config_dir / 'text-backend.json'
+        if not backend_file.exists():
+            pgrep = ctx.probe(['pgrep', '-u', str(os.getuid()), '-x', 'fcitx5'])
+            backend = 'fcitx' if pgrep.returncode == 0 and fcitx_conf_path(ctx).is_file() else 'portal'
+            if ctx.dry_run:
+                info(f'（演练）会写入 {backend_file}：{backend}')
+            else:
+                write_atomic(backend_file, json.dumps(dict(version=1, backend=backend)).encode(), 0o600)
+                ok(f'手机输入法文字通道：{backend}')
+        ctx.run(['systemctl', '--user', 'daemon-reload'])
     ctx.restart_bridge = True
 
 

@@ -417,7 +417,7 @@ class KdeLegacyGrantTests(CliCase):
         """Run the portal step with a fake probe that rotates the token it restores."""
         ctx = self.context()
         ctx.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        ctx.restore_state.write_text('{"version":1,"token":"old"}')
+        ctx.restore_state.write_text('{"version":1,"restore_token":"old"}')
         commands = self.commands
 
         def run(argv, capture=False, check=True, **kwargs):
@@ -425,12 +425,12 @@ class KdeLegacyGrantTests(CliCase):
             commands.append(argv)
             path = Path(argv[argv.index('--restore-state') + 1])
             if '--identify-output' in argv:
-                path.write_text('{"version":1,"token":"rotated"}')
+                path.write_text('{"version":1,"restore_token":"rotated"}')
                 return completed(argv, identify_code, json.dumps(dict(frames=10, output=shares)))
             connector = argv[argv.index('--expect-output') + 1]
             if connector in failing:
                 raise cli.SetupError('screen sharing was cancelled')
-            path.write_text('{"version":1,"token":"new"}')
+            path.write_text('{"version":1,"restore_token":"new"}')
             return completed(argv)
         ctx.run = run
         with patch.object(cli, 'plasma_wayland', return_value=True), \
@@ -443,19 +443,214 @@ class KdeLegacyGrantTests(CliCase):
     def dialogs(self):
         return [c[c.index('--expect-output') + 1] for c in self.commands if '--expect-output' in c]
 
-    def test_single_screen_upgrade_reuses_the_old_grant_without_a_dialog(self):
+    def test_portal_only_prepares_the_old_grant_without_breaking_the_running_runtime(self):
         ctx, done = self.portal(self.ONE)
         self.assertTrue(done)
         self.assertEqual(self.dialogs(), [])
-        self.assertFalse(ctx.restore_state.exists(), 'moved, not copied')
-        self.assertIn('rotated', (ctx.state_dir / 'portal-probe.DP-2.json').read_text())
+        self.assertIn('rotated', ctx.restore_state.read_text())
+        self.assertEqual(ctx.pending_legacy_grant, ctx.state_dir / 'portal-probe.DP-2.json')
+        self.assertFalse(ctx.pending_legacy_grant.exists(), 'not moved until runtime staging succeeds')
 
     def test_the_old_grant_goes_to_the_screen_it_shares_and_only_the_others_are_asked(self):
         ctx, done = self.portal(self.TWO, shares='DP-1')
         self.assertTrue(done)
         self.assertEqual(self.dialogs(), ['DP-2'])
-        self.assertIn('rotated', (ctx.state_dir / 'portal-probe.DP-1.json').read_text())
+        self.assertIn('rotated', ctx.restore_state.read_text())
+        self.assertEqual(ctx.pending_legacy_grant, ctx.state_dir / 'portal-probe.DP-1.json')
+        self.assertFalse(ctx.pending_legacy_grant.exists())
         self.assertIn('new', (ctx.state_dir / 'portal-probe.DP-2.json').read_text())
+
+    def test_runtime_is_not_skipped_with_a_pending_grant(self):
+        ctx, _ = self.portal(self.ONE)
+        with patch.object(cli, 'runtime_units_current', return_value=True), \
+                patch.object(cli, 'package_bundle') as package:
+            self.assertFalse(cli.runtime_done(ctx))
+        package.assert_not_called()
+
+    def test_packaging_failure_after_portal_keeps_the_rotated_token_and_running_bridge(self):
+        ctx, _ = self.portal(self.ONE)
+        ctx.backend = 'nvidia'
+        self.record_commands(ctx)
+        self.active.add('uu-native-bridge')
+        with patch.object(cli, 'package_bundle', side_effect=cli.SetupError('invalid runtime')):
+            with self.assertRaises(cli.SetupError):
+                self.quiet(cli.run_steps, ctx, {'portal', 'runtime', 'start'}, set())
+        self.assertIn('rotated', ctx.restore_state.read_text())
+        self.assertFalse(ctx.pending_legacy_grant.exists())
+        self.assertFalse(any('stop' in command for command in self.commands))
+        self.assertFalse(any('start' in command for command in self.commands))
+
+    def test_successful_runtime_moves_the_token_only_after_all_commands_succeed(self):
+        ctx, _ = self.portal(self.ONE)
+        target = ctx.pending_legacy_grant
+        ctx.backend = 'nvidia'
+        self.record_commands(ctx)
+        self.active.add('uu-native-bridge')
+        record = ctx.run
+
+        def run(argv, **kwargs):
+            self.assertTrue(ctx.restore_state.exists(), 'old runtime retains its token until staging completes')
+            self.assertFalse(target.exists(), 'no duplicate capability')
+            return record(argv, **kwargs)
+
+        ctx.run = run
+        with patch.object(cli, 'package_bundle', return_value=self.home / 'bundle'):
+            self.quiet(cli.runtime_run, ctx)
+        self.assertFalse(ctx.restore_state.exists(), 'moved, not copied')
+        self.assertIn('rotated', target.read_text())
+        self.assertIsNone(ctx.pending_legacy_grant)
+        self.assertTrue(ctx.restart_bridge)
+        self.assertEqual(self.commands[-1], ['systemctl', '--user', 'daemon-reload'])
+
+    def test_retrying_only_runtime_in_a_new_process_prepares_the_legacy_grant(self):
+        old, _ = self.portal(self.ONE)
+        identify = old.run
+        ctx = self.record_commands(self.context())
+        ctx.backend = 'nvidia'
+        record = ctx.run
+
+        def run(argv, **kwargs):
+            return identify(argv, **kwargs) if '--identify-output' in argv else record(argv, **kwargs)
+
+        ctx.run = run
+        with patch.object(cli, 'plasma_wayland', return_value=True), \
+                patch('desktop_backend.plasma_state', return_value=self.ONE), \
+                patch.object(cli, 'package_bundle', return_value=self.home / 'bundle'):
+            self.quiet(cli.runtime_run, ctx)
+        self.assertFalse(ctx.restore_state.exists())
+        self.assertIn('rotated', (ctx.state_dir / 'portal-probe.DP-2.json').read_text())
+
+    def test_runtime_does_not_repeat_an_already_completed_explicit_regrant(self):
+        ctx, _ = self.portal(self.ONE, identify_code=1)
+        ctx.args.regrant_screen = True
+        ctx.backend = 'nvidia'
+        self.record_commands(ctx)
+        with patch.object(cli, 'plasma_wayland', return_value=True), \
+                patch('desktop_backend.plasma_state', return_value=self.ONE), \
+                patch.object(cli, 'portal_run') as portal, \
+                patch.object(cli, 'package_bundle', return_value=self.home / 'bundle'):
+            self.quiet(cli.runtime_run, ctx)
+        portal.assert_not_called()
+        self.assertTrue(ctx.restore_state.exists())
+        self.assertTrue((ctx.state_dir / 'portal-probe.DP-2.json').exists())
+
+    def test_staging_failures_restore_config_units_and_the_previously_running_bridge(self):
+        for failure in ('install', 'mappings', 'daemon-reload', 'interrupt'):
+            with self.subTest(failure=failure):
+                ctx, _ = self.portal(self.ONE)
+                ctx.backend = 'nvidia'
+                ctx.config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                ctx.unit_dir.mkdir(parents=True, exist_ok=True)
+                files = [ctx.runtime_config, *(ctx.unit_dir / (name + '.service') for name in cli.SERVICES)]
+                for path in files:
+                    path.write_text('{"bundle":"old"}' if path == ctx.runtime_config else cli.SERVICE_MARKER + '\n# old\n')
+                    path.chmod(0o600 if path == ctx.runtime_config else 0o644)
+                saved = {path: (path.read_bytes(), path.stat().st_mode & 0o777) for path in files}
+                self.commands.clear()
+                self.record_commands(ctx)
+                self.active.add('uu-native-bridge')
+                record = ctx.run
+                failed = False
+
+                def run(argv, **kwargs):
+                    nonlocal failed
+                    command = [str(part) for part in argv]
+                    result = record(argv, **kwargs)
+                    installing = len(command) > 1 and command[1].endswith('install-uu-native-service.py')
+                    if installing:
+                        for path in files:
+                            path.write_text('partial-new-runtime')
+                    phase = ('install' if installing else 'mappings' if len(command) > 1 and
+                             command[1].endswith('configure-uu-wine-mappings.py') else
+                             'daemon-reload' if 'daemon-reload' in command else None)
+                    if not failed and (phase == failure or (failure == 'interrupt' and installing)):
+                        failed = True
+                        if failure == 'interrupt':
+                            raise KeyboardInterrupt()
+                        raise cli.SetupError('staging failed: ' + failure)
+                    return result
+
+                ctx.run = run
+                error = KeyboardInterrupt if failure == 'interrupt' else cli.SetupError
+                with patch.object(cli, 'package_bundle', return_value=self.home / 'bundle'):
+                    with self.assertRaises(error):
+                        self.quiet(cli.runtime_run, ctx)
+                self.assertTrue(failed)
+                self.assertEqual(saved, {path: (path.read_bytes(), path.stat().st_mode & 0o777) for path in files})
+                self.assertIn('rotated', ctx.restore_state.read_text())
+                self.assertFalse(ctx.pending_legacy_grant.exists())
+                self.assertFalse((ctx.config_dir / 'text-backend.json').exists())
+                self.assertEqual(self.commands[-2:], [['systemctl', '--user', 'daemon-reload'],
+                                                       ['systemctl', '--user', 'start', 'uu-native-bridge.service']])
+                self.assertFalse(ctx.restart_bridge)
+
+    def test_failed_migration_does_not_start_a_previously_inactive_bridge(self):
+        ctx, _ = self.portal(self.ONE)
+        ctx.backend = 'nvidia'
+        self.record_commands(ctx)
+        with patch.object(cli, 'package_bundle', return_value=self.home / 'bundle'), \
+                patch.object(Path, 'rename', side_effect=OSError('cannot move token')):
+            with self.assertRaises(OSError):
+                self.quiet(cli.runtime_run, ctx)
+        self.assertIn('rotated', ctx.restore_state.read_text())
+        self.assertFalse(ctx.pending_legacy_grant.exists())
+        self.assertFalse(ctx.runtime_config.exists())
+        self.assertFalse((ctx.config_dir / 'text-backend.json').exists())
+        self.assertFalse(any('start' in command for command in self.commands))
+
+    def test_an_unexpected_output_grant_is_not_overwritten(self):
+        ctx, _ = self.portal(self.ONE)
+        target = ctx.pending_legacy_grant
+        target.write_text('{"version":1,"restore_token":"other"}')
+        ctx.backend = 'nvidia'
+        self.record_commands(ctx)
+        with patch.object(cli, 'package_bundle', return_value=self.home / 'bundle'):
+            with self.assertRaises(cli.SetupError):
+                self.quiet(cli.runtime_run, ctx)
+        self.assertIn('rotated', ctx.restore_state.read_text())
+        self.assertIn('other', target.read_text())
+
+    def test_interrupt_just_after_moving_the_grant_moves_the_valid_token_back(self):
+        ctx, _ = self.portal(self.ONE)
+        target = ctx.pending_legacy_grant
+        ctx.backend = 'nvidia'
+        self.record_commands(ctx)
+        self.active.add('uu-native-bridge')
+        rename = Path.rename
+
+        def move(path, destination):
+            result = rename(path, destination)
+            if path == ctx.restore_state:
+                raise KeyboardInterrupt()
+            return result
+
+        with patch.object(cli, 'package_bundle', return_value=self.home / 'bundle'), \
+                patch.object(Path, 'rename', move):
+            with self.assertRaises(KeyboardInterrupt):
+                self.quiet(cli.runtime_run, ctx)
+        self.assertIn('rotated', ctx.restore_state.read_text())
+        self.assertFalse(target.exists())
+        self.assertEqual(self.commands[-1], ['systemctl', '--user', 'start', 'uu-native-bridge.service'])
+
+    def test_recovery_failure_is_reported_without_losing_the_rotated_token(self):
+        ctx, _ = self.portal(self.ONE)
+        ctx.backend = 'nvidia'
+        self.record_commands(ctx)
+        self.active.add('uu-native-bridge')
+        record = ctx.run
+
+        def run(argv, **kwargs):
+            command = [str(part) for part in argv]
+            if command[-1] == 'daemon-reload':
+                raise cli.SetupError('reload failed')
+            return record(argv, **kwargs)
+
+        ctx.run = run
+        with patch.object(cli, 'package_bundle', return_value=self.home / 'bundle'):
+            with self.assertRaisesRegex(cli.SetupError, '自动恢复也未完成'):
+                self.quiet(cli.runtime_run, ctx)
+        self.assertIn('rotated', ctx.restore_state.read_text())
+        self.assertFalse(ctx.pending_legacy_grant.exists())
 
     def test_a_failed_grant_keeps_the_old_grant_for_the_running_runtime(self):
         with self.assertRaises(cli.SetupError):
