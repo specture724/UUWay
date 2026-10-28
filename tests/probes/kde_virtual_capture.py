@@ -22,12 +22,14 @@ if __name__ == '__main__':
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as remote:
             remote.connect(str(Path(os.environ['XDG_RUNTIME_DIR']) / 'pipewire-0'))
+            environment = dict(os.environ, UURB_CAPTURE_DURATION_SECONDS='2',
+                               UURB_CAPTURE_SIZE='%dx%d' % (screen['width'], screen['height']))
             captured = subprocess.run([str(arguments.capture_binary), str(remote.fileno()),
                                        str(screen['node']), '--vulkan-import'],
-                                      env=dict(os.environ, UURB_CAPTURE_DURATION_SECONDS='2',
-                                               UURB_CAPTURE_SIZE='%dx%d' % (screen['width'], screen['height'])),
-                                      pass_fds=(remote.fileno(),), check=True, timeout=15,
+                                      env=environment, pass_fds=(remote.fileno(),), timeout=15,
                                       capture_output=True, text=True)
+            if captured.returncode:
+                raise RuntimeError('Native capture failed: %s' % captured.stderr)
         metrics = json.loads(captured.stdout)
         if metrics['frames'] < 1 or metrics.get('dmabuf_only') is not True:
             raise RuntimeError('Virtual capture did not deliver valid DMA-BUF frames: %s' % metrics)

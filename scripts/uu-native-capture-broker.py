@@ -687,7 +687,8 @@ def run(path, restore_state, duration=3600, cursor_mode='embedded', cursor_path=
             inherited = (connection.fileno(), status_channel.writer.fileno()) + ((cursor_fd,) if cursor_fd is not None else ())
             connector = monitor['connector'] if monitor else None
             node = monitor.get('node') if monitor else None
-            track_cursor_mode = 'embedded' if (monitor and monitor.get('virtual')) else cursor_mode
+            track_cursor_mode = ('embedded' if monitor and monitor.get('virtual') and
+                                 monitor.get('node') is None else cursor_mode)
             producer = subprocess.Popen(producer_command(restore_state, connection.fileno(), duration,
                 track_cursor_mode, None if track_cursor_mode != cursor_mode else cursor_fd,
                 status_channel.writer.fileno(), capture_binary, connector, node), pass_fds=inherited,
@@ -916,12 +917,12 @@ def run_multi(path, restore_state, duration=3600, cursor_mode='embedded', cursor
             generation += 1
             cursor_index = int(monitor['gdi_name'][11:]) - 1 if monitor else 0
             cursor = cursor_states.get(cursor_index)
-            virtual_track = bool(monitor and monitor.get('virtual'))
-            track_cursor_mode = 'embedded' if virtual_track else cursor_mode
-            if virtual_track:
+            embedded_virtual = bool(monitor and monitor.get('virtual') and monitor.get('node') is None)
+            track_cursor_mode = 'embedded' if embedded_virtual else cursor_mode
+            if embedded_virtual:
                 cursor = None
             if (cursor is None and cursor_directory is not None and
-                    cursor_mode in ('metadata', 'composited') and not virtual_track):
+                    cursor_mode in ('metadata', 'composited') and not embedded_virtual):
                 cursor_file = cursor_directory / ('cursor.%d.state' % cursor_index)
                 remove_cursor_file(cursor_file)
                 try:

@@ -51,8 +51,8 @@ def producer_environment(args, base):
                 'UURB_CURSOR_METADATA_BACKEND', 'UURB_CURSOR_COMPOSITE'):
         environment.pop(key, None)
     if args.cursor_mode in ('metadata', 'composited'):
-        # Mutter uses cursor id=0 for "hidden", distinct from no update.
-        environment['UURB_CURSOR_METADATA_BACKEND'] = 'mutter'
+        # KDE 使用标准 SPA 光标信息；Mutter 的隐藏标记需要单独处理。
+        environment['UURB_CURSOR_METADATA_BACKEND'] = 'spa' if args.node >= 0 else 'mutter'
         environment['UURB_CURSOR_STATE_FD'] = str(args.cursor_state_fd)
     if args.cursor_mode == 'composited':
         environment['UURB_CURSOR_COMPOSITE'] = '1'

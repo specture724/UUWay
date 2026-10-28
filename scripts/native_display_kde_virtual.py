@@ -39,7 +39,7 @@ SCREENCAST = 'org.freedesktop.portal.ScreenCast'
 SESSION_INTERFACE = 'org.freedesktop.portal.Session'
 REGISTRY_INTERFACE = 'org.freedesktop.host.portal.Registry'
 SOURCE_VIRTUAL = 4
-CURSOR_EMBEDDED = 2
+CURSOR_METADATA = 4
 PERSIST_WHILE_RUNNING = 2
 KWIN_SERVICE = 'org.kde.KWin'
 ADAPTER_NAME = 'GameViewer Virtual Display Adapter'
@@ -184,7 +184,7 @@ class _Portal:
         session = values['session_handle']
         selection = {'types': self.GLib.Variant('u', SOURCE_VIRTUAL),
                      'multiple': self.GLib.Variant('b', False),
-                     'cursor_mode': self.GLib.Variant('u', CURSOR_EMBEDDED),
+                     'cursor_mode': self.GLib.Variant('u', CURSOR_METADATA),
                      'persist_mode': self.GLib.Variant('u', PERSIST_WHILE_RUNNING)}
         if token:
             selection['restore_token'] = self.GLib.Variant('s', token)

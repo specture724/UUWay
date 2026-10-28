@@ -26,6 +26,9 @@ then make the only active one. On GNOME UUWay creates a Mutter
    stable when physical outputs disappear from the active monitor list.
    The broker requests the monitor's actual size through `UURB_CAPTURE_SIZE`
    so PipeWire negotiates frames matching the Windows display configuration.
+   KDE streams request separate cursor metadata. The producer reads standard
+   SPA cursor updates and publishes them through the per-display and USER32
+   cursor snapshots; the video frames contain no embedded cursor.
 4. UU's `SetDisplayConfig` arrives as the internal `0x55520001` topology
    request. When it selects the virtual output the module enables and positions
    it at the origin, makes it primary, and only then disables the physical
