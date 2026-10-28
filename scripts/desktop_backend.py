@@ -163,8 +163,8 @@ def input_map(monitors):
 def plasma_topology(data):
     """Worker topology: the primary output as the tracked origin, plus the whole input map.
 
-    The map covers every shown output, so any change to any of them is a
-    topology change that restarts the worker with a fresh input mapping.
+    The map covers every shown output and is refreshed by the input worker
+    while the remote session remains active.
     """
     layout = plasma_layout(data)
     primary = layout['monitors'][0]

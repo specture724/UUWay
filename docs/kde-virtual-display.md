@@ -35,6 +35,10 @@ then make the only active one. On GNOME UUWay creates a Mutter
    physical outputs are restored when UU removes the display, when the bridge
    or its video track goes away, and by `ExecStopPost --recover` after a crash,
    so a failed session cannot leave the panel dark.
+6. The supervisor writes the current KScreen input mapping to the private
+   `input-map.json` in its runtime directory. The native input worker reloads
+   atomic file updates while retaining its authenticated connection and uinput
+   devices. Adding, removing or selecting a virtual output keeps UU running.
 
 ## Known limitations
 
@@ -71,6 +75,9 @@ dimensions must match the mode UU submits when entering its virtual topology.
   captured frame into Vulkan without mapping pixels to the CPU.
 * Without a saved authorization, IDD discovery is rejected while physical
   display inspection remains available.
+* A live uinput test adds and removes a real Portal output, verifies the map
+  changes from one output to two and back to one, and confirms that the input
+  connection and bridge runtime survive both stable layout changes.
 * Remote-client validation must confirm continuous video and input during
   exclusive mode, physical output restoration on exit, and both privacy-screen
   and display-off controls.
