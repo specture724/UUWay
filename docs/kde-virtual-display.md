@@ -8,65 +8,30 @@ KScreen. This document covers display-off support on Plasma 6.8 / KWin 6.8.
 
 ## How it works
 
-1. `KScreenVirtualDisplays.create()` opens a ScreenCast portal session with
-   `types=VIRTUAL` (`4`). Plasma 6.8's portal asks KWin for a virtual output
-   (`stream_virtual_output`) and returns its PipeWire node, size and the usual
-   restore token. Authorization runs separately before enabling the feature;
-   ticking "allow without asking" stores the grant in the portal permission
-   store, which unattended remote use needs. The live display service requires
-   a saved token and bounds each portal request to two seconds.
-2. The new output appears in KScreen as `Virtual-virtual-xdp-kde-uuway` with a
-   single mode. The module enables it, places it beside the physical layout and
-   keeps the previous primary output primary, so the monitor order the display
-   ABI reports to UU stays stable.
-3. The output is reported to UU as `virtual=true` and its stream node is added
-   to the `inspect` reply. The capture broker captures a virtual output from
-   that node (`mutter-direct-capture.py --node`); there is no portal grant to
-   restore for an output the portal itself created.
-   Windows display names and device paths are assigned by connector and stay
-   stable when physical outputs disappear from the active monitor list.
-   The broker requests the monitor's actual size through `UURB_CAPTURE_SIZE`
-   so PipeWire negotiates frames matching the Windows display configuration.
-   KDE streams request separate cursor metadata. The producer reads standard
-   SPA cursor updates and publishes them through the per-display and USER32
-   cursor snapshots; the video frames contain no embedded cursor.
-4. UU's `SetDisplayConfig` arrives as the internal `0x55520001` topology
-   request. When it selects the virtual output the module enables and positions
-   it at the origin, makes it primary, and only then disables the physical
-   outputs, so a desktop always keeps an active output and the panel goes dark.
-   Replaying the saved physical layout restores the journalled KScreen layout.
-   Restore requests work with and without `SAVE_TO_DATABASE`. Physical-only
-   restoration closes unselected virtual outputs. Requests containing both
-   physical and owned virtual paths restore the physical layout and retain the
-   selected virtual outputs.
-5. The pre-change layout is journalled to `virtual-layout-recovery.json`. The
-   physical outputs are restored when UU removes the display, when the bridge
-   or its video track goes away, and by `ExecStopPost --recover` after a crash,
-   so a failed session cannot leave the panel dark.
-6. The supervisor writes the current KScreen input mapping to the private
-   `input-map.json` in its runtime directory. The native input worker reloads
-   atomic file updates while retaining its authenticated connection and uinput
-   devices. Adding, removing or selecting a virtual output keeps UU running.
-7. UU stores the display-off selection in `private_screen`: `1` is
-   `PS_NOT_SET`, `2` is `PS_NORMAL_PRIVACY`, and `3` is `PS_ENHANCED_PRIVACY`.
-   The service reads the current setting during connection setup and watches
-   subsequent changes. Enabling display-off selects virtual slot zero;
-   disabling it removes that output and restores the physical layout.
-   UU may retain its virtual-screen label after the physical output is restored;
-   the adapter leaves the client's screen selection under client control.
-   Standalone virtual slots retain their explicit topology controls.
+1. The display service restores a saved ScreenCast Portal grant with
+   `types=VIRTUAL`, creating one KWin output and receiving its PipeWire node.
+   Its Windows name and device path stay stable across physical output changes.
+2. UU's IDD requests create the output and select it through `SetDisplayConfig`.
+   KScreen enables the virtual output before disabling the physical outputs.
+   Restore requests accept both `0x14a0` and `0x10a0` flags.
+3. Capture uses the owned PipeWire node and its actual dimensions through
+   `UURB_CAPTURE_SIZE`. Separate SPA cursor metadata prevents duplicate cursors.
+   The input worker reloads `input-map.json` without restarting UU or its input
+   connection when the layout changes.
+4. UU's `private_screen` setting (`1` off, `2`/`3` enabled) controls slot zero
+   during connection setup and subsequent changes. Disabling display-off
+   restores the physical layout. The client may retain its virtual-screen label.
+5. `virtual-layout-recovery.json` records the physical layout. Owner-process
+   death, closed video tracks, service shutdown and `ExecStopPost --recover`
+   restore physical outputs before releasing the virtual output.
 
 ## Known limitations
 
-* The portal fixes the virtual output's resolution when the grant is created
-  (the dialog's resolution picker). KWin has no runtime mode change for it, so
-  the module advertises only the real mode. Requests for another topology mode
-  fail before changing the physical outputs. UU's IDD mode catalogue is accepted
-  as driver configuration; it does not add unsupported KWin modes.
-* KDE's display configuration is a real layout change, not a temporary Mutter
-  transaction; there is no 30-second confirmation dialog. The journal and the
-  recovery file are the rollback mechanism.
-* Rotation, mirroring and Intel-only encoding keep their existing limits.
+* The service owns one virtual output at a time, at the resolution chosen in
+  the Portal grant. It validates UU's IDD mode catalogue and advertises only
+  the real output mode. Other requested resolutions fail before layout changes.
+* KScreen changes the actual desktop layout. Recovery uses the saved journal;
+  rotation, mirroring and Intel-only encoding retain their existing limits.
 
 ## Authorization
 
@@ -85,23 +50,12 @@ dimensions must match the mode UU submits when entering its virtual topology.
 
 ## Verification
 
-* Virtual output creation, placement, exclusive switch (physical panel dark,
-  desktop on the virtual output) and restore all work on Plasma 6.8 / KWin 6.8.
-* Independent 2560×1440 capture delivers DMA-BUF frames and imports every
-  captured frame into Vulkan without mapping pixels to the CPU.
-* Without a saved authorization, IDD discovery is rejected while physical
-  display inspection remains available.
-* A live uinput test adds and removes a real Portal output, verifies the map
-  changes from one output to two and back to one, and confirms that the input
-  connection and bridge runtime survive both stable layout changes.
-* The live Win32 lifecycle probe exercises exclusive mode, mixed-output
-  restoration, verify-only requests and physical-only restoration with the
-  actual `0x14a0` and `0x10a0` flags, using the production display adapter and
-  the real KDE display service.
-* Remote-client tests confirm that ordinary connections use DP-3, enabling
-  display-off moves the desktop to the virtual output and turns off the
-  physical panel, and disabling it restores the panel. Continuous video,
-  keyboard and mouse work during display-off; separate cursor metadata avoids
-  duplicate cursors.
-* With display-off selected, disconnecting and reconnecting automatically uses
-  the virtual output, keeps the physical panel off and preserves remote input.
+* `kde_display_lifecycle_live.c` and its Python runner exercise the production
+  Win32 adapter against KDE: create, select, validate, restore with both flag
+  combinations, and retain physical display identities and positions.
+* `kde_virtual_capture.py` checks 2560×1440 DMA-BUF capture and Vulkan imports.
+* `kde_input_map_live.py` checks live uinput map updates while adding and
+  removing a Portal output, retaining the input connection and bridge runtime.
+* Remote-client tests confirm ordinary DP-3 capture, display-off enable/disable,
+  reconnect with display-off selected, continuous video and keyboard/mouse,
+  and a single cursor.

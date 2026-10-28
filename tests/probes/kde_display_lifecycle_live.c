@@ -35,6 +35,7 @@ int wmain(int argc, WCHAR **argv)
     for (UINT i = 0; i < snapshot.monitor_count; ++i)
         REQUIRE(!(snapshot.monitors[i].flags & UURB_DISPLAY_MONITOR_VIRTUAL));
     REQUIRE(snapshot.monitors[0].flags & UURB_DISPLAY_MONITOR_KSCREEN);
+    struct uurb_display_topology original = snapshot;
 
     DWORD initial_plug[6] = {0};
     REQUIRE(native_virtual_control_api(native_display_endpoint, 0x30c004, initial_plug, sizeof(initial_plug)) == 0);
@@ -88,8 +89,13 @@ int wmain(int argc, WCHAR **argv)
         REQUIRE(native_multi_snapshot(&snapshot, TRUE));
         REQUIRE(snapshot.monitor_count == physical_count);
         created_seven = FALSE;
-        for (UINT i = 0; i < snapshot.monitor_count; ++i)
+        for (UINT i = 0; i < snapshot.monitor_count; ++i) {
             REQUIRE(!(snapshot.monitors[i].flags & UURB_DISPLAY_MONITOR_VIRTUAL));
+            REQUIRE(!strcmp(snapshot.monitors[i].gdi_name, original.monitors[i].gdi_name));
+            REQUIRE(!strcmp(snapshot.monitors[i].device_path, original.monitors[i].device_path));
+            REQUIRE(snapshot.monitors[i].x == original.monitors[i].x &&
+                    snapshot.monitors[i].y == original.monitors[i].y);
+        }
         printf("KDE_LIVE_RESTORE flags=%lu physical_outputs=%u passed\n",
                (unsigned long)restore_flags[test], snapshot.monitor_count);
     }

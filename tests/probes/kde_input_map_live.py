@@ -24,6 +24,13 @@ def events(path):
             for line in path.read_text().splitlines() if line.startswith('UURB_NATIVE_INPUT ')]
 
 
+def bridge_identity(path):
+    subprocess.run(['systemctl', '--user', 'is-active', '--quiet', 'uu-native-bridge.service'], check=True)
+    pid = subprocess.check_output(['systemctl', '--user', 'show', 'uu-native-bridge.service',
+                                   '--property=MainPID', '--value'], text=True)
+    return int(pid), json.loads(path.read_text())
+
+
 def wait_event(path, predicate, process):
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -42,7 +49,7 @@ if __name__ == '__main__':
     parser.add_argument('--input-binary', type=Path, required=True)
     arguments = parser.parse_args()
     active_runtime = Path.home() / '.local/state/uurb/active-runtime.json'
-    runtime_before = json.loads(active_runtime.read_text())
+    runtime_before = bridge_identity(active_runtime)
     root = Path(__file__).resolve().parents[2]
     with tempfile.TemporaryDirectory(dir=root / 'build/kde-validation', prefix='input-map-') as temporary:
         directory = Path(temporary)
@@ -80,7 +87,7 @@ if __name__ == '__main__':
                 wait_event(log_path, lambda event: event.get('event') == 'output_map_updated' and
                            event.get('mapped_outputs') == len(monitors), worker)
                 time.sleep(4)
-                if json.loads(active_runtime.read_text()) != runtime_before:
+                if bridge_identity(active_runtime) != runtime_before:
                     raise RuntimeError('The bridge restarted after adding a virtual output')
                 portal.close(screen['session'])
                 screen = None
@@ -102,7 +109,7 @@ if __name__ == '__main__':
                 if events(log_path)[-1].get('mapped_outputs') != len(baseline):
                     raise RuntimeError('Input worker did not acknowledge restoration')
                 time.sleep(4)
-                if json.loads(active_runtime.read_text()) != runtime_before:
+                if bridge_identity(active_runtime) != runtime_before:
                     raise RuntimeError('The bridge restarted after removing a virtual output')
                 print(json.dumps(dict(event='live_input_map_verified', input_pid=worker.pid,
                                       mapped_outputs=[len(baseline), len(monitors), len(restored)],

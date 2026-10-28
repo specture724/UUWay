@@ -105,10 +105,6 @@ static LONG WINAPI traced_display_set(UINT32 paths, DISPLAYCONFIG_PATH_INFO *pat
                                      UINT32 modes, DISPLAYCONFIG_MODE_INFO *mode, UINT32 flags)
 {
     LONG result = native_display_adapter_enabled ? native_display_set_config(paths, path, modes, mode, flags) : display_set(paths, path, modes, mode, flags);
-    char details[224];
-    snprintf(details, sizeof(details), "UURB_NATIVE_DISPLAY {\"event\":\"topology_request\",\"paths\":%u,\"modes\":%u,\"flags\":%lu,\"result\":%ld}\r\n",
-             paths, modes, (unsigned long)flags, (long)result);
-    write_log(details); flush_log();
     display_trace(4, flags, result, 0, 0, 0, 0, FALSE);
     return result;
 }

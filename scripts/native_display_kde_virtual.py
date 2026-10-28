@@ -1,25 +1,3 @@
-"""Portal-backed virtual displays for Plasma Wayland.
-
-UU's IDD feature ("Super Screen", 防窥/隐私屏, 关闭被控端显示屏) asks the host
-for an extra output.  Plasma 6.8's ScreenCast portal can create one at runtime:
-``SelectSources(types=VIRTUAL)`` makes KWin add a real virtual output, and the
-returned PipeWire stream is that output's content.  KScreen can then enable,
-position and prioritise it like any other output, and disabling the physical
-outputs makes the desktop migrate onto the virtual one while the panel goes
-dark.
-
-That replaces the Mutter ``RecordVirtual`` backend.  The public RPC surface is
-identical to :class:`native_virtual_display.VirtualDisplays` so the display
-service only swaps the object.  Differences on purpose:
-
-* The virtual output's resolution is fixed by the portal session, not by a
-  Mutter mode negotiation, so the advertised mode catalogue is narrowed to the
-  mode the output really has.
-* KDE display configuration is a real layout change instead of a temporary
-  Mutter transaction.  The pre-change layout is journalled to
-  ``virtual-layout-recovery.json``; a service crash or an unplugged virtual
-  session puts the physical outputs back instead of leaving the panel dark.
-"""
 import configparser
 import copy
 import json
@@ -31,13 +9,13 @@ import struct
 import subprocess
 import time
 
-from desktop_backend import plasma_layout, plasma_state
+from desktop_backend import _output_active as _active, plasma_layout, plasma_state
+from native_runtime_state import read_private, write_private
 
 SERVICE = 'org.freedesktop.portal.Desktop'
 PATH = '/org/freedesktop/portal/desktop'
 SCREENCAST = 'org.freedesktop.portal.ScreenCast'
 SESSION_INTERFACE = 'org.freedesktop.portal.Session'
-REGISTRY_INTERFACE = 'org.freedesktop.host.portal.Registry'
 SOURCE_VIRTUAL = 4
 CURSOR_METADATA = 4
 PERSIST_WHILE_RUNNING = 2
@@ -82,11 +60,6 @@ def _position(output):
     return pos.get('x'), pos.get('y')
 
 
-def _active(output):
-    """Portal-owned outputs omit ``enabled``; KScreen still renders them."""
-    return output.get('enabled') is True or str(output.get('name', '')).startswith('Virtual-')
-
-
 def _mode_refresh(output):
     current = output.get('currentModeId')
     for mode in output.get('modes') or []:
@@ -95,6 +68,20 @@ def _mode_refresh(output):
             if isinstance(refresh, (int, float)) and refresh > 0:
                 return min(round(float(refresh), 3), float(MAX_REFRESH_HZ))
     return None
+
+
+def _restore_layout(baseline):
+    live = {item['name'] for item in _outputs()}
+    arguments = []
+    for item in baseline['outputs']:
+        if item['connector'] in live:
+            arguments.extend(['output.%s.enable' % item['connector'],
+                              'output.%s.position.%d,%d' % (item['connector'], item['x'], item['y'])])
+    primary = next((item for item in baseline['outputs'] if item['priority'] == 1), None)
+    if primary is not None and primary['connector'] in live:
+        arguments.append('output.%s.priority.1' % primary['connector'])
+    if arguments:
+        _kscreen(arguments)
 
 
 def _mode_entry(width, height, refresh):
@@ -125,14 +112,9 @@ class _Portal:
     def __init__(self, bus, Gio, GLib):
         self.bus, self.Gio, self.GLib = bus, Gio, GLib
         self.sender = bus.get_unique_name()[1:].replace('.', '_')
-
-    def register(self):
-        try:
-            self.bus.call_sync(SERVICE, PATH, REGISTRY_INTERFACE, 'Register',
-                               self.GLib.Variant('(sa{sv})', ('uuway', {})), None,
-                               self.Gio.DBusCallFlags.NONE, 10000, None)
-        except self.GLib.Error:
-            pass
+        bus.call_sync(SERVICE, PATH, 'org.freedesktop.host.portal.Registry', 'Register',
+                      GLib.Variant('(sa{sv})', ('uuway', {})), None,
+                      Gio.DBusCallFlags.NONE, 10000, None)
 
     def request(self, method, signature, arguments, options, timeout=2):
         token = 'uurb_' + secrets.token_hex(12)
@@ -179,7 +161,6 @@ class _Portal:
         if not interactive and token is None:
             raise RuntimeError('Run %s before enabling virtual displays' % AUTHORIZATION_SCRIPT)
         timeout = 300 if interactive else 2
-        self.register()
         values = self.request('CreateSession', '(a{sv})', (),
                               {'session_handle_token': self.GLib.Variant('s', 'uurb_' + secrets.token_hex(12))},
                               timeout=timeout)
@@ -213,9 +194,8 @@ class _Portal:
             self.close(session)
             raise RuntimeError('Select %dx%d in the KDE authorization dialog' % expected_size)
         if restore_path is not None and started.get('restore_token'):
-            save_token(restore_path, started['restore_token'])
-        return dict(session=session, node=int(node), width=int(width), height=int(height),
-                    mapping=str(properties.get('mapping_id') or '')[:128])
+            write_private(restore_path, dict(version=1, restore_token=started['restore_token']))
+        return dict(session=session, node=int(node), width=int(width), height=int(height))
 
     def close(self, session):
         try:
@@ -226,22 +206,13 @@ class _Portal:
 
 
 def load_token(path):
-    try:
-        info = path.lstat()
-        if not path.is_file() or info.st_uid != os.geteuid() or info.st_mode & 0o077:
-            return None
-        value = json.loads(path.read_text())
-        token = value.get('restore_token') if isinstance(value, dict) else None
-        return token if isinstance(token, str) and 0 < len(token) <= 4096 else None
-    except (OSError, ValueError):
+    if not path.exists() and not path.is_symlink():
         return None
-
-
-def save_token(path, token):
-    temp = path.with_name(path.name + '.new')
-    temp.write_text(json.dumps(dict(version=1, restore_token=token)))
-    os.chmod(temp, 0o600)
-    os.replace(temp, path)
+    value = read_private(path, max_bytes=8192)
+    token = value.get('restore_token')
+    if value.get('version') != 1 or not isinstance(token, str) or not 0 < len(token) <= 4096:
+        raise ValueError('Invalid KDE virtual display authorization')
+    return token
 
 
 class KScreenVirtualDisplays:
@@ -259,15 +230,12 @@ class KScreenVirtualDisplays:
         self.user_settings = Path(user_settings) if user_settings is not None else None
         self.recovery_path = Path(recovery_path) if recovery_path is not None else None
         self.screens = {}
-        self.modes = {index: [(1920, 1080, 60)] for index in range(8)}
         self.exclusive_baseline = None
         self.owner_fd = None
         self.owner_pid = None
         self.parent_fd = None
-        self.session_seen = False
         self.idle_since = None
         self.session_updated = 0
-        self.managed_connectors = set()
         self.display_ids = {}
         self.remote_tracks = 0
         self.last_privacy_mode = None
@@ -335,11 +303,7 @@ class KScreenVirtualDisplays:
             self.privacy_owned = True
             return
         screen = self.create(0)
-        self.decorate(self.backend.monitors())
-        live = self._layout()
-        packet = struct.pack('<7I2i', live['serial'], 0, 1, self.display_ids[screen['connector']],
-                             screen['width'], screen['height'], round(screen['refresh'] * 1000), 0, 0)
-        self.apply_topology(packet)
+        self._activate(screen)
         self.privacy_owned = True
 
     # -- lifecycle ------------------------------------------------------
@@ -348,8 +312,10 @@ class KScreenVirtualDisplays:
             raise ValueError('Invalid virtual display slot')
         if slot in self.screens:
             return self.screens[slot]
+        if self.screens:
+            raise ValueError('KDE display-off owns one virtual output at a time')
         if modes is not None:
-            self.modes[slot] = validate_modes(modes)
+            validate_modes(modes)
         before = {item['name']: item for item in _outputs()}
         if len([name for name, item in before.items() if _active(item)]) >= 8:
             raise ValueError('At most eight active displays are supported')
@@ -362,9 +328,6 @@ class KScreenVirtualDisplays:
             connector = self._wait_connector(before, created, timeout=5)
             stage = 'position_output'
             refresh = self._refresh_for(connector)
-            actual = (created['width'], created['height'], int(round(refresh)))
-            catalogue = [mode for mode in self.modes.get(slot, []) if tuple(mode) != actual]
-            self.modes[slot] = [actual] + catalogue
             self._place(connector, created['width'], baseline)
             primary = next((item for item in baseline['outputs'] if item['priority'] == 1), None)
             if primary is not None:
@@ -373,9 +336,8 @@ class KScreenVirtualDisplays:
             screen = dict(slot=slot, session=created['session'], node=created['node'],
                           connector=connector, width=created['width'], height=created['height'],
                           refresh=refresh, baseline_topology=copy.deepcopy(baseline),
-                          mapping=created['mapping'], topology_seen=False)
+                          topology_seen=False)
             self.screens[slot] = screen
-            self.managed_connectors.add(connector)
             if self.idle_since is not None:
                 self.idle_since = time.monotonic()
             self._event('create_complete', slot=slot, connector=connector, width=created['width'],
@@ -418,38 +380,27 @@ class KScreenVirtualDisplays:
     def remove(self, slot):
         if type(slot) is not int or not 0 <= slot < 8:
             raise ValueError('Invalid virtual display slot')
-        screen = self.screens.pop(slot, None)
+        screen = self.screens.get(slot)
         if screen is None:
             return dict(removed=False)
         self._event('remove_begin', slot=slot, connector=screen['connector'])
         if self.exclusive_baseline is not None:
             self.restore_physical()
-        baseline = screen.get('baseline_topology')
+        else:
+            _restore_layout(screen['baseline_topology'])
         self.portal.close(screen['session'])
-        self.managed_connectors.discard(screen['connector'])
+        del self.screens[slot]
         if screen.get('owner_fd') is not None:
             os.close(screen['owner_fd'])
         self.pump()
-        if baseline is not None:
-            try:
-                self._restore(baseline)
-            except Exception as error:
-                self._event('remove_failed', slot=slot, error_type=type(error).__name__,
-                            reason=str(error)[:200])
-                raise
         self._event('remove_complete', slot=slot)
         return dict(removed=True)
 
     def release_all(self):
-        removed, failed = [], []
-        for slot in reversed(tuple(self.screens)):
-            try:
-                if self.remove(slot).get('removed'):
-                    removed.append(slot)
-            except Exception as error:
-                failed.append(slot)
-                self._event('release_failed', slot=slot, error_type=type(error).__name__)
-        return dict(released=removed, count=len(removed), failed=failed)
+        removed = list(self.screens)
+        for slot in removed:
+            self.remove(slot)
+        return dict(released=removed, count=len(removed), failed=[])
 
     def close(self):
         try:
@@ -462,16 +413,6 @@ class KScreenVirtualDisplays:
                     setattr(self, descriptor, None)
 
     # -- layout ---------------------------------------------------------
-    def _layout(self):
-        """The topology UU sees: same serial and Windows-space geometry as the
-        display snapshot, so a serial it read from `inspect` still matches."""
-        state = plasma_layout(plasma_state())
-        return dict(serial=state['serial'], outputs=[
-            dict(connector=item['connector'], x=int(item['x']), y=int(item['y']),
-                 width=int(item['width']), height=int(item['height']), mode=item.get('mode'),
-                 refresh=float(item.get('refresh') or 60.0), priority=1 if item.get('primary') else 0)
-            for item in state['monitors']])
-
     def _raw_layout(self):
         """KScreen-space layout used to restore a previous physical arrangement."""
         outputs = []
@@ -486,25 +427,11 @@ class KScreenVirtualDisplays:
                                 width=width, height=height, mode=item.get('currentModeId'),
                                 refresh=_mode_refresh(item) or 60.0,
                                 priority=int(item.get('priority') or 0)))
-        return dict(serial=self._layout()['serial'], outputs=outputs)
+        return dict(outputs=outputs)
 
     def _restore(self, baseline):
         """Re-enable and reposition the physical outputs recorded before a change."""
-        live = {item['name']: item for item in _outputs()}
-        for item in baseline['outputs']:
-            if item['connector'] not in live:
-                continue
-            if not _active(live[item['connector']]):
-                _kscreen(['output.%s.enable' % item['connector']])
-        for item in baseline['outputs']:
-            if item['connector'] not in live:
-                continue
-            _kscreen(['output.%s.position.%d,%d' % (item['connector'], item['x'], item['y'])])
-        primary = next((item for item in baseline['outputs'] if item['priority'] == 1), None)
-        if primary is not None and primary['connector'] in live:
-            _kscreen(['output.%s.priority.1' % primary['connector']])
-        if self.exclusive_baseline is not None and not self.screens:
-            self.exclusive_baseline = None
+        _restore_layout(baseline)
         if self.recovery_path is not None:
             self.recovery_path.unlink(missing_ok=True)
 
@@ -517,6 +444,22 @@ class KScreenVirtualDisplays:
         self.exclusive_baseline = None
         self._event('exclusive_restore_complete')
 
+    def _activate(self, screen):
+        if self.exclusive_baseline is None:
+            self.exclusive_baseline = screen['baseline_topology']
+            if self.recovery_path is not None:
+                write_private(self.recovery_path, dict(version=1, identity=self.backend.identity(),
+                                                      baseline=self.exclusive_baseline))
+        connector = screen['connector']
+        # 虚拟输出生效后再关闭物理输出，保证桌面始终存在可用的显示器。
+        _kscreen(['output.%s.enable' % connector, 'output.%s.position.0,0' % connector,
+                  'output.%s.priority.1' % connector])
+        physical = ['output.%s.disable' % item['connector'] for item in self.exclusive_baseline['outputs']]
+        if physical:
+            _kscreen(physical)
+        screen['topology_seen'] = True
+        self._event('exclusive_complete', outputs=1)
+
     def apply_topology(self, data):
         """应用虚拟输出拓扑，或恢复记录的物理屏布局。"""
         if len(data) < 36:
@@ -524,11 +467,11 @@ class KScreenVirtualDisplays:
         serial, flags, count = struct.unpack_from('<3I', data)
         if not 1 <= count <= 8 or len(data) != 12 + count * 24 or flags not in (0, 1):
             raise ValueError('Invalid bounded native topology')
-        live = self._layout()
+        serial_now = plasma_layout(plasma_state())['serial']
         raw = self._raw_layout()
-        self._event('topology_received', requested_serial=serial, current_serial=live['serial'],
+        self._event('topology_received', requested_serial=serial, current_serial=serial_now,
                     paths=count, verify=bool(flags))
-        if serial != live['serial']:
+        if serial != serial_now:
             raise ValueError('Stale native topology')
         requested = list(struct.iter_unpack('<4I2i', data[12:]))
         # Windows source id 使用 connector 对应的固定身份。
@@ -595,52 +538,14 @@ class KScreenVirtualDisplays:
                     screen['topology_seen'] = True
             self._event('physical_topology_complete', outputs=count)
             return dict(completed=True)
-        if self.exclusive_baseline is None:
-            self.exclusive_baseline = copy.deepcopy(raw)
-            if self.recovery_path is not None:
-                from native_runtime_state import write_private
-                write_private(self.recovery_path, dict(version=1, identity=self.backend.identity(),
-                                                      baseline=self.exclusive_baseline))
-        self._event('exclusive_begin', outputs=len(requested))
-        # Enable and place the selected outputs first: a desktop must always
-        # keep one active output, so never disable the old one before the new
-        # one is live.
-        for name, (_, width, height, refresh, x, y) in zip(names, requested):
-            _kscreen(['output.%s.enable' % name, 'output.%s.position.%d,%d' % (name, x, y)])
-        primary = next(name for name, entry in zip(names, requested) if entry[4] == 0 and entry[5] == 0)
-        _kscreen(['output.%s.priority.1' % primary])
-        for item in raw['outputs']:
-            if item['connector'] not in names:
-                _kscreen(['output.%s.disable' % item['connector']])
-        self._event('exclusive_complete', outputs=len(names))
-        for screen in self.screens.values():
-            if screen['connector'] in names:
-                screen['topology_seen'] = True
+        self._activate(selected_virtual[0])
         if (0 in self.screens and self.screens[0]['connector'] in names and
                 privacy_mode in PRIVACY_ENABLED_MODES):
             self.privacy_owned = True
         return dict(completed=True)
 
     def set_output(self, connector, enabled):
-        if not isinstance(connector, str) or len(connector) > 128 or type(enabled) is not bool:
-            raise ValueError('Invalid output selection')
-        if self.find(connector):
-            raise ValueError('Use virtual-remove for owned Super Screens')
-        live = {item['name']: item for item in _outputs()}
-        if connector not in live:
-            raise ValueError('Output is no longer connected')
-        if _active(live[connector]) == enabled:
-            return dict(completed=True)
-        if not enabled:
-            remaining = [item for name, item in live.items() if name != connector and _active(item)]
-            if not remaining:
-                raise ValueError('The last active desktop output cannot be disabled')
-            _kscreen(['output.%s.disable' % connector])
-        else:
-            x = max((_position(item)[0] or 0) + (_size(item)[0] or 0) for item in live.values() if _active(item))
-            _kscreen(['output.%s.enable' % connector, 'output.%s.position.%d,0' % (connector, int(x))])
-        self._event('output_changed', connector=connector, enabled=enabled, persistent=False)
-        return dict(completed=True)
+        raise ValueError('KDE output selection is controlled by display-off topology')
 
     # -- UU IDD wire ----------------------------------------------------
     def ioctl(self, code, payload):
@@ -652,12 +557,9 @@ class KScreenVirtualDisplays:
             try:
                 return self.apply_topology(data)
             except (ValueError, RuntimeError) as error:
-                if self.exclusive_baseline is not None:
-                    try:
-                        self.restore_physical()
-                    except Exception:
-                        pass
                 self._event('topology_rejected', reason=str(error)[:200])
+                if self.exclusive_baseline is not None:
+                    self.restore_physical()
                 raise
         if code == 0 and not data:
             if not self.screens and load_token(self.portal_state) is None:
@@ -680,13 +582,7 @@ class KScreenVirtualDisplays:
                 raise ValueError('Invalid virtual monitor mode array')
             received = [list(mode) for mode in struct.iter_unpack('<3I', data[8:])]
             self._event('modes_received', slot=slot, count=count)
-            requested = validate_modes(received)
-            screen = self.screens.get(slot)
-            actual = (screen['width'], screen['height'], int(round(screen['refresh']))) if screen else None
-            modes = ([actual] if actual is not None else []) + [mode for mode in requested if mode != actual]
-            self.modes[slot] = modes
-            self._event('modes_accepted', slot=slot, count=len(modes),
-                        portal_mode=json.dumps(list(actual)) if actual else None)
+            validate_modes(received)
             return dict(completed=True)
         raise ValueError('Unsupported virtual display operation')
 
@@ -719,7 +615,6 @@ class KScreenVirtualDisplays:
             self.privacy_suppressed = False
         self.remote_tracks = tracks
         if tracks:
-            self.session_seen = True
             self.idle_since = None
         elif self.idle_since is None:
             self.idle_since = now
@@ -749,13 +644,10 @@ class KScreenVirtualDisplays:
         for slot, screen in list(self.screens.items()):
             if screen.get('owner_fd') is not None and select.select([screen['owner_fd']], [], [], 0)[0]:
                 self._event('uu_process_exited', slot=slot)
-                try:
-                    self.remove(slot)
-                    if slot == 0:
-                        self.privacy_owned = False
-                        self.privacy_suppressed = True
-                except Exception as error:
-                    self._event('owner_cleanup_failed', slot=slot, error_type=type(error).__name__)
+                self.remove(slot)
+                if slot == 0:
+                    self.privacy_owned = False
+                    self.privacy_suppressed = True
         if allow_idle and self.screens and self.idle_since is not None and now - self.idle_since >= 15:
             self._event('remote_tracks_closed', quiet_seconds=15)
             self.release_all()
@@ -788,22 +680,19 @@ class KScreenVirtualDisplays:
         return monitors
 
     def status(self):
-        self.pump()
         outputs = []
         for item in _outputs():
             screen = self.find(item['name'])
             width, height = _size(item)
-            outputs.append(dict(connector=item['name'], enabled=_active(item),
-                                name=item['name'][:128],
-                                kind='super_screen' if screen else 'portal' if str(item['name']).startswith('Virtual-')
+            outputs.append(dict(connector=item['name'], name=item['name'][:128],
+                                enabled=_active(item), managed=screen is not None,
+                                kind='super_screen' if screen else 'portal' if item['name'].startswith('Virtual-')
                                      else 'physical',
-                                managed=screen is not None,
                                 slot=screen['slot'] if screen else None,
-                                width=width, height=height,
-                                refresh=_mode_refresh(item)))
+                                width=width, height=height, refresh=_mode_refresh(item)))
         return dict(supported=bool(self.screens) or load_token(self.portal_state) is not None,
                     exclusive=self.exclusive_baseline is not None,
-                    managed_connectors=sorted(self.managed_connectors), outputs=outputs,
+                    managed_connectors=[item['connector'] for item in self.screens.values()], outputs=outputs,
                     tracks_idle=self.idle_since is not None,
                     cleanup_after_seconds=max(0, round(15 - (time.monotonic() - self.idle_since)))
                         if self.screens and self.idle_since is not None else None,
@@ -812,8 +701,6 @@ class KScreenVirtualDisplays:
 
 
 def recover_layout(config):
-    """Put the physical outputs back after an unclean display-service exit."""
-    from native_runtime_state import read_private
     path = Path(config['state_parent']) / 'virtual-layout-recovery.json'
     if not path.exists():
         return 0
@@ -821,17 +708,8 @@ def recover_layout(config):
     if record.get('version') != 1:
         path.unlink(missing_ok=True)
         return 0
-    baseline = record.get('baseline') or {}
-    live = {item['name'] for item in _outputs()}
-    restored = 0
-    for item in baseline.get('outputs', []):
-        if item['connector'] not in live:
-            continue
-        _kscreen(['output.%s.enable' % item['connector'],
-                  'output.%s.position.%d,%d' % (item['connector'], item['x'], item['y'])])
-        if item['priority'] == 1:
-            _kscreen(['output.%s.priority.1' % item['connector']])
-        restored += 1
+    baseline = record['baseline']
+    _restore_layout(baseline)
     path.unlink(missing_ok=True)
-    print(json.dumps(dict(event='virtual_crash_layout_restored', outputs=restored)), flush=True)
-    return restored
+    print(json.dumps(dict(event='virtual_crash_layout_restored', outputs=len(baseline['outputs']))), flush=True)
+    return len(baseline['outputs'])
