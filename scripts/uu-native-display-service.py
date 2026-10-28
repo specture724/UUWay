@@ -42,7 +42,7 @@ def kscreen_services(config, parent):
         virtual = KScreenVirtualDisplays(
             backend, parent / 'virtual-portal-state.json',
             parent / 'virtual-layout-recovery.json',
-            capture_binary=Path(config['bundle']) / 'capture/uu-pipewire-native-probe')
+            user_settings=Path(config['prefix']) / 'drive_c/ProgramData/Netease/GameViewer/user_setting.ini')
     else:
         virtual = UnavailableVirtualDisplays()
     return backend, virtual, DisplayRouter(backend, parent,
@@ -179,6 +179,7 @@ def run(config_path):
                     else:
                         result = dict(ok=True, **guardian.request(request))
                         if op == 'inspect':
+                            result['display_backend'] = 'kscreen' if plasma_wayland() else 'mutter'
                             decorate = getattr(virtual, 'decorate', None)
                             if decorate is not None:
                                 decorate(result['monitors'])

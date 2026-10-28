@@ -1,9 +1,10 @@
-# KDE virtual displays (Plasma Wayland)
+# KDE display-off support (Plasma Wayland)
 
-UU's IDD feature — 超级屏 (Super Screen), 防窥/隐私屏 and 关闭被控端显示屏 (turn the
-controlled display off) — needs an extra output that the host can create and
-then make the only active one. On GNOME UUWay creates a Mutter
-`RecordVirtual` monitor. This branch does the same on Plasma.
+UU's 关闭被控端显示屏 (turn the controlled display off) uses an IDD virtual
+monitor to keep the remote desktop available while physical outputs are
+disabled. On Plasma Wayland, UUWay creates a KWin virtual output through the
+ScreenCast portal, captures it through PipeWire and applies its layout through
+KScreen. This document covers display-off support on Plasma 6.8 / KWin 6.8.
 
 ## How it works
 
@@ -34,6 +35,10 @@ then make the only active one. On GNOME UUWay creates a Mutter
    it at the origin, makes it primary, and only then disables the physical
    outputs, so a desktop always keeps an active output and the panel goes dark.
    Replaying the saved physical layout restores the journalled KScreen layout.
+   Restore requests work with and without `SAVE_TO_DATABASE`. Physical-only
+   restoration closes unselected virtual outputs. Requests containing both
+   physical and owned virtual paths restore the physical layout and retain the
+   selected virtual outputs.
 5. The pre-change layout is journalled to `virtual-layout-recovery.json`. The
    physical outputs are restored when UU removes the display, when the bridge
    or its video track goes away, and by `ExecStopPost --recover` after a crash,
@@ -42,6 +47,14 @@ then make the only active one. On GNOME UUWay creates a Mutter
    `input-map.json` in its runtime directory. The native input worker reloads
    atomic file updates while retaining its authenticated connection and uinput
    devices. Adding, removing or selecting a virtual output keeps UU running.
+7. UU stores the display-off selection in `private_screen`: `1` is
+   `PS_NOT_SET`, `2` is `PS_NORMAL_PRIVACY`, and `3` is `PS_ENHANCED_PRIVACY`.
+   The service reads the current setting during connection setup and watches
+   subsequent changes. Enabling display-off selects virtual slot zero;
+   disabling it removes that output and restores the physical layout.
+   UU may retain its virtual-screen label after the physical output is restored;
+   the adapter leaves the client's screen selection under client control.
+   Standalone virtual slots retain their explicit topology controls.
 
 ## Known limitations
 
@@ -70,7 +83,7 @@ The command creates and closes a virtual output while keeping physical outputs
 enabled. It rejects a different size before saving the token. The requested
 dimensions must match the mode UU submits when entering its virtual topology.
 
-## Verification so far
+## Verification
 
 * Virtual output creation, placement, exclusive switch (physical panel dark,
   desktop on the virtual output) and restore all work on Plasma 6.8 / KWin 6.8.
@@ -81,6 +94,14 @@ dimensions must match the mode UU submits when entering its virtual topology.
 * A live uinput test adds and removes a real Portal output, verifies the map
   changes from one output to two and back to one, and confirms that the input
   connection and bridge runtime survive both stable layout changes.
-* Remote-client validation must confirm continuous video and input during
-  exclusive mode, physical output restoration on exit, and both privacy-screen
-  and display-off controls.
+* The live Win32 lifecycle probe exercises exclusive mode, mixed-output
+  restoration, verify-only requests and physical-only restoration with the
+  actual `0x14a0` and `0x10a0` flags, using the production display adapter and
+  the real KDE display service.
+* Remote-client tests confirm that ordinary connections use DP-3, enabling
+  display-off moves the desktop to the virtual output and turns off the
+  physical panel, and disabling it restores the panel. Continuous video,
+  keyboard and mouse work during display-off; separate cursor metadata avoids
+  duplicate cursors.
+* With display-off selected, disconnecting and reconnecting automatically uses
+  the virtual output, keeps the physical panel off and preserves remote input.

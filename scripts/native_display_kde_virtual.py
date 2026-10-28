@@ -20,13 +20,13 @@ service only swaps the object.  Differences on purpose:
   ``virtual-layout-recovery.json``; a service crash or an unplugged virtual
   session puts the physical outputs back instead of leaving the panel dark.
 """
+import configparser
 import copy
 import json
 import os
 from pathlib import Path
 import secrets
 import select
-import socket
 import struct
 import subprocess
 import time
@@ -41,15 +41,18 @@ REGISTRY_INTERFACE = 'org.freedesktop.host.portal.Registry'
 SOURCE_VIRTUAL = 4
 CURSOR_METADATA = 4
 PERSIST_WHILE_RUNNING = 2
-KWIN_SERVICE = 'org.kde.KWin'
 ADAPTER_NAME = 'GameViewer Virtual Display Adapter'
 MAX_MODES = 64
 MAX_REFRESH_HZ = 144
 AUTHORIZATION_SCRIPT = 'authorize-kde-virtual-display.py'
+PS_UNSPECIFIED = 0
+PS_NOT_SET = 1
+PS_NORMAL_PRIVACY = 2
+PS_ENHANCED_PRIVACY = 3
+PRIVACY_ENABLED_MODES = (PS_NORMAL_PRIVACY, PS_ENHANCED_PRIVACY)
 # 0x55520001 is UUWay's internal bridge RPC carrying UU's SetDisplayConfig
 # request; the 0x30c0xx codes are UU's reviewed IDD control messages.
 TOPOLOGY_CONTROL = 0x55520001
-KSCREEN_JSON_TIMEOUT = 5
 KScreen = '/usr/bin/kscreen-doctor'
 
 
@@ -122,7 +125,6 @@ class _Portal:
     def __init__(self, bus, Gio, GLib):
         self.bus, self.Gio, self.GLib = bus, Gio, GLib
         self.sender = bus.get_unique_name()[1:].replace('.', '_')
-        self.restore_path = None
 
     def register(self):
         try:
@@ -247,15 +249,15 @@ class KScreenVirtualDisplays:
 
     available = True
 
-    def __init__(self, backend, portal_state, recovery_path, capture_binary=None):
+    def __init__(self, backend, portal_state, recovery_path, user_settings=None):
         from gi.repository import Gio, GLib
         self.Gio, self.GLib = Gio, GLib
         self.backend = backend
         self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         self.portal = _Portal(self.bus, Gio, GLib)
         self.portal_state = Path(portal_state)
+        self.user_settings = Path(user_settings) if user_settings is not None else None
         self.recovery_path = Path(recovery_path) if recovery_path is not None else None
-        self.capture_binary = capture_binary
         self.screens = {}
         self.modes = {index: [(1920, 1080, 60)] for index in range(8)}
         self.exclusive_baseline = None
@@ -267,6 +269,11 @@ class KScreenVirtualDisplays:
         self.session_updated = 0
         self.managed_connectors = set()
         self.display_ids = {}
+        self.remote_tracks = 0
+        self.last_privacy_mode = None
+        self.privacy_mode_since = 0
+        self.privacy_owned = False
+        self.privacy_suppressed = False
 
     # -- events ---------------------------------------------------------
     def _event(self, name, **fields):
@@ -290,6 +297,50 @@ class KScreenVirtualDisplays:
 
     def entries(self, screen):
         return [_mode_entry(screen['width'], screen['height'], screen['refresh'])]
+
+    def _privacy_mode(self):
+        if self.user_settings is None:
+            return None
+        settings = configparser.ConfigParser(interpolation=None)
+        with self.user_settings.open() as source:
+            settings.read_file(source)
+        section = settings['global']
+        mode = int(section['private_screen']) if 'private_screen' in section else PS_NOT_SET
+        if mode not in (PS_UNSPECIFIED, PS_NOT_SET, *PRIVACY_ENABLED_MODES):
+            raise ValueError('Unsupported UU privacy mode')
+        return mode
+
+    def _sync_privacy_mode(self):
+        mode = self._privacy_mode()
+        if mode is None:
+            return
+        if mode != self.last_privacy_mode:
+            self._event('privacy_mode_changed', mode=mode)
+            self.last_privacy_mode = mode
+            self.privacy_suppressed = False
+            self.privacy_mode_since = time.monotonic()
+            return
+        if time.monotonic() - self.privacy_mode_since < 0.25:
+            return
+        if mode in (PS_UNSPECIFIED, PS_NOT_SET):
+            if self.privacy_owned:
+                self.remove(0)
+                self.privacy_owned = False
+                self._event('privacy_disabled')
+            return
+        if not self.remote_tracks or self.privacy_suppressed:
+            return
+        screen = self.screens.get(0)
+        if screen is not None and self.exclusive_baseline is not None:
+            self.privacy_owned = True
+            return
+        screen = self.create(0)
+        self.decorate(self.backend.monitors())
+        live = self._layout()
+        packet = struct.pack('<7I2i', live['serial'], 0, 1, self.display_ids[screen['connector']],
+                             screen['width'], screen['height'], round(screen['refresh'] * 1000), 0, 0)
+        self.apply_topology(packet)
+        self.privacy_owned = True
 
     # -- lifecycle ------------------------------------------------------
     def create(self, slot, modes=None):
@@ -322,7 +373,7 @@ class KScreenVirtualDisplays:
             screen = dict(slot=slot, session=created['session'], node=created['node'],
                           connector=connector, width=created['width'], height=created['height'],
                           refresh=refresh, baseline_topology=copy.deepcopy(baseline),
-                          mapping=created['mapping'])
+                          mapping=created['mapping'], topology_seen=False)
             self.screens[slot] = screen
             self.managed_connectors.add(connector)
             if self.idle_since is not None:
@@ -467,7 +518,7 @@ class KScreenVirtualDisplays:
         self._event('exclusive_restore_complete')
 
     def apply_topology(self, data):
-        """UU's exclusive virtual topology: only the virtual output stays active."""
+        """应用虚拟输出拓扑，或恢复记录的物理屏布局。"""
         if len(data) < 36:
             raise ValueError('Incomplete native topology')
         serial, flags, count = struct.unpack_from('<3I', data)
@@ -476,10 +527,7 @@ class KScreenVirtualDisplays:
         live = self._layout()
         raw = self._raw_layout()
         self._event('topology_received', requested_serial=serial, current_serial=live['serial'],
-                    paths=count, verify=bool(flags),
-                    catalogue=json.dumps([[entry[0], entry[1], entry[2], entry[3], entry[4], entry[5]]
-                                          for entry in struct.iter_unpack('<4I2i', data[12:])],
-                                         separators=(',', ':')))
+                    paths=count, verify=bool(flags))
         if serial != live['serial']:
             raise ValueError('Stale native topology')
         requested = list(struct.iter_unpack('<4I2i', data[12:]))
@@ -489,26 +537,63 @@ class KScreenVirtualDisplays:
         if None in names:
             raise ValueError('Unknown native output identity')
         owned = {screen['connector'] for screen in self.screens.values()}
-        if not set(names) <= owned:
-            if set(names) & owned:
-                raise ValueError('Mixed physical and virtual topology is unsupported')
-            if not flags:
-                self.restore_physical()
-            self._event('topology_physical_only', paths=count)
-            return dict(completed=True)
+        baseline = self.exclusive_baseline
+        if baseline is None:
+            baseline = next((screen['baseline_topology'] for screen in self.screens.values()), raw)
+        physical = {item['connector']: item for item in baseline['outputs']
+                    if item['connector'] not in owned}
+        requested_physical = set(names) - owned
+        if requested_physical and requested_physical != set(physical):
+            raise ValueError('Physical restoration must select the saved physical outputs')
         if len(set(names)) != count:
             raise ValueError('Duplicate native output')
         if sum(x == 0 and y == 0 for _, _, _, _, x, y in requested) != 1:
             raise ValueError('Virtual topology needs one origin output')
         for name, (_, width, height, refresh, x, y) in zip(names, requested):
-            mode = next((entry for entry in self.entries(self.find(name))
+            screen = self.find(name)
+            entries = self.entries(screen) if screen is not None else [physical[name]]
+            mode = next((entry for entry in entries
                          if entry['width'] == width and entry['height'] == height and
                          abs(entry['refresh'] - refresh / 1000) <= 1), None)
             if mode is None:
-                raise ValueError('Topology requests must select an advertised virtual mode')
-            if x < 0 or y < 0:
+                raise ValueError('Topology must select the saved physical mode or an advertised virtual mode')
+            if screen is not None and (x < 0 or y < 0):
                 raise ValueError('Virtual topology must use non-negative origins')
+        selected_virtual = [self.find(name) for name in names if name in owned]
+        privacy_mode = self._privacy_mode()
+        if (requested_physical and len(selected_virtual) == 1 and selected_virtual[0]['slot'] == 0 and
+                not selected_virtual[0]['topology_seen'] and privacy_mode is not None):
+            screen = selected_virtual[0]
+            if privacy_mode in PRIVACY_ENABLED_MODES and not self.privacy_suppressed:
+                selected = next(entry for name, entry in zip(names, requested) if name == screen['connector'])
+                requested = [(*selected[:4], 0, 0)]
+                names = [screen['connector']]
+                requested_physical = set()
+                self._event('privacy_exclusive_selected', mode=privacy_mode)
+            else:
+                requested = [entry for name, entry in zip(names, requested) if name in requested_physical]
+                names = [name for name in names if name in requested_physical]
+            count = len(names)
         if flags:
+            return dict(completed=True)
+        if requested_physical:
+            self.privacy_suppressed = privacy_mode in PRIVACY_ENABLED_MODES
+            self.privacy_owned = False
+            if self.exclusive_baseline is not None:
+                self.restore_physical()
+            else:
+                self._restore(baseline)
+            for name, (_, _, _, _, x, y) in zip(names, requested):
+                if name in owned:
+                    _kscreen(['output.%s.enable' % name, 'output.%s.position.%d,%d' % (name, x, y)])
+            primary = next(name for name, entry in zip(names, requested) if entry[4] == 0 and entry[5] == 0)
+            _kscreen(['output.%s.priority.1' % primary])
+            for slot, screen in list(self.screens.items()):
+                if screen['connector'] not in names:
+                    self.remove(slot)
+                else:
+                    screen['topology_seen'] = True
+            self._event('physical_topology_complete', outputs=count)
             return dict(completed=True)
         if self.exclusive_baseline is None:
             self.exclusive_baseline = copy.deepcopy(raw)
@@ -528,6 +613,12 @@ class KScreenVirtualDisplays:
             if item['connector'] not in names:
                 _kscreen(['output.%s.disable' % item['connector']])
         self._event('exclusive_complete', outputs=len(names))
+        for screen in self.screens.values():
+            if screen['connector'] in names:
+                screen['topology_seen'] = True
+        if (0 in self.screens and self.screens[0]['connector'] in names and
+                privacy_mode in PRIVACY_ENABLED_MODES):
+            self.privacy_owned = True
         return dict(completed=True)
 
     def set_output(self, connector, enabled):
@@ -616,11 +707,17 @@ class KScreenVirtualDisplays:
                 self.release_all()
                 os.close(self.owner_fd)
             self.owner_fd, self.owner_pid = owner_fd, pid
+            self.privacy_owned = False
+            self.remote_tracks = 0
+            self.privacy_suppressed = False
             if self.parent_fd is not None:
                 os.close(self.parent_fd)
             self.parent_fd = parent_fd
             self._event('session_owner', pid=pid)
         now = time.monotonic()
+        if tracks and not self.remote_tracks:
+            self.privacy_suppressed = False
+        self.remote_tracks = tracks
         if tracks:
             self.session_seen = True
             self.idle_since = None
@@ -642,6 +739,8 @@ class KScreenVirtualDisplays:
                                           now - self.session_updated > 30):
             self._event('owner_lost', pid=self.owner_pid)
             self.release_all()
+            self.privacy_owned = False
+            self.remote_tracks = 0
             os.close(self.owner_fd)
             self.owner_fd, self.owner_pid = None, None
             if self.parent_fd is not None:
@@ -652,11 +751,16 @@ class KScreenVirtualDisplays:
                 self._event('uu_process_exited', slot=slot)
                 try:
                     self.remove(slot)
+                    if slot == 0:
+                        self.privacy_owned = False
+                        self.privacy_suppressed = True
                 except Exception as error:
                     self._event('owner_cleanup_failed', slot=slot, error_type=type(error).__name__)
         if allow_idle and self.screens and self.idle_since is not None and now - self.idle_since >= 15:
             self._event('remote_tracks_closed', quiet_seconds=15)
             self.release_all()
+            self.privacy_owned = False
+        self._sync_privacy_mode()
 
     # -- display ABI ----------------------------------------------------
     def decorate(self, monitors):
