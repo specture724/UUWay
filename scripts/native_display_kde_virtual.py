@@ -45,6 +45,7 @@ KWIN_SERVICE = 'org.kde.KWin'
 ADAPTER_NAME = 'GameViewer Virtual Display Adapter'
 MAX_MODES = 64
 MAX_REFRESH_HZ = 144
+AUTHORIZATION_SCRIPT = 'authorize-kde-virtual-display.py'
 # 0x55520001 is UUWay's internal bridge RPC carrying UU's SetDisplayConfig
 # request; the 0x30c0xx codes are UU's reviewed IDD control messages.
 TOPOLOGY_CONTROL = 0x55520001
@@ -131,7 +132,7 @@ class _Portal:
         except self.GLib.Error:
             pass
 
-    def request(self, method, signature, arguments, options, timeout=120):
+    def request(self, method, signature, arguments, options, timeout=2):
         token = 'uurb_' + secrets.token_hex(12)
         path = '%s/request/%s/%s' % (PATH, self.sender, token)
         options = dict(options, handle_token=self.GLib.Variant('s', token))
@@ -148,7 +149,7 @@ class _Portal:
         try:
             returned = self.bus.call_sync(SERVICE, PATH, SCREENCAST, method,
                                           self.GLib.Variant(signature, (*arguments, options)), None,
-                                          self.Gio.DBusCallFlags.NONE, 10000, None).unpack()[0]
+                                          self.Gio.DBusCallFlags.NONE, min(timeout * 1000, 10000), None).unpack()[0]
             if returned != path:
                 raise RuntimeError('Unexpected portal request handle')
             if not response:
@@ -170,29 +171,29 @@ class _Portal:
                 except self.GLib.Error:
                     pass
 
-    def open(self, restore_path):
+    def open(self, restore_path, interactive=False, expected_size=None):
         """Create one virtual-screen session; returns (session, node, size, token)."""
+        token = load_token(restore_path) if restore_path is not None else None
+        if not interactive and token is None:
+            raise RuntimeError('Run %s before enabling virtual displays' % AUTHORIZATION_SCRIPT)
+        timeout = 120 if interactive else 2
         self.register()
         values = self.request('CreateSession', '(a{sv})', (),
-                              {'session_handle_token': self.GLib.Variant('s', 'uurb_' + secrets.token_hex(12))})
+                              {'session_handle_token': self.GLib.Variant('s', 'uurb_' + secrets.token_hex(12))},
+                              timeout=timeout)
         session = values['session_handle']
         selection = {'types': self.GLib.Variant('u', SOURCE_VIRTUAL),
                      'multiple': self.GLib.Variant('b', False),
                      'cursor_mode': self.GLib.Variant('u', CURSOR_EMBEDDED),
                      'persist_mode': self.GLib.Variant('u', PERSIST_WHILE_RUNNING)}
-        token = None
-        if restore_path is not None:
-            token = load_token(restore_path)
-            if token:
-                selection['restore_token'] = self.GLib.Variant('s', token)
+        if token:
+            selection['restore_token'] = self.GLib.Variant('s', token)
         try:
-            self.request('SelectSources', '(oa{sv})', (session,), selection)
-            started = self.request('Start', '(osa{sv})', (session, ''), {})
+            self.request('SelectSources', '(oa{sv})', (session,), selection, timeout=timeout)
+            started = self.request('Start', '(osa{sv})', (session, ''), {}, timeout=timeout)
         except BaseException:
             self.close(session)
             raise
-        if restore_path is not None and started.get('restore_token'):
-            save_token(restore_path, started['restore_token'])
         streams = started.get('streams') or []
         if len(streams) != 1:
             self.close(session)
@@ -206,6 +207,11 @@ class _Portal:
         if not (320 <= int(width) <= 4096 and 320 <= int(height) <= 4096):
             self.close(session)
             raise RuntimeError('Unexpected virtual screen size')
+        if expected_size is not None and (int(width), int(height)) != expected_size:
+            self.close(session)
+            raise RuntimeError('Select %dx%d in the KDE authorization dialog' % expected_size)
+        if restore_path is not None and started.get('restore_token'):
+            save_token(restore_path, started['restore_token'])
         return dict(session=session, node=int(node), width=int(width), height=int(height),
                     mapping=str(properties.get('mapping_id') or '')[:128])
 
@@ -261,7 +267,6 @@ class KScreenVirtualDisplays:
         self.session_updated = 0
         self.managed_connectors = set()
         self.display_ids = {}
-        self.snapshot_monitors = []
 
     # -- events ---------------------------------------------------------
     def _event(self, name, **fields):
@@ -277,26 +282,14 @@ class KScreenVirtualDisplays:
             context.iteration(False)
 
     # -- lookup ---------------------------------------------------------
-    def note_monitors(self, monitors):
-        """Record the monitor order the display ABI just exposed to UU."""
-        if not isinstance(monitors, list):
-            return
-        snapshot = [(item.get('connector'), item.get('virtual') is True) for item in monitors
-                    if isinstance(item, dict)]
-        if snapshot:
-            self.snapshot_monitors = snapshot
-
     def _id_map(self):
-        if self.snapshot_monitors:
-            return {index: connector for index, (connector, _) in enumerate(self.snapshot_monitors)}
-        live = self._layout()
-        return {index: item['connector'] for index, item in enumerate(live['outputs'])}
+        return {identity: connector for connector, identity in self.display_ids.items()}
 
     def find(self, connector):
         return next((screen for screen in self.screens.values() if screen['connector'] == connector), None)
 
     def entries(self, screen):
-        return [_mode_entry(*mode) for mode in self.modes[screen['slot']][:MAX_MODES]]
+        return [_mode_entry(screen['width'], screen['height'], screen['refresh'])]
 
     # -- lifecycle ------------------------------------------------------
     def create(self, slot, modes=None):
@@ -490,18 +483,17 @@ class KScreenVirtualDisplays:
         if serial != live['serial']:
             raise ValueError('Stale native topology')
         requested = list(struct.iter_unpack('<4I2i', data[12:]))
-        # UU numbers paths by Windows source id, which the display snapshot
-        # derives from the monitor order, so map through that same order.
+        # Windows source id 使用 connector 对应的固定身份。
         by_id = self._id_map()
         names = [by_id.get(entry[0]) for entry in requested]
         if None in names:
             raise ValueError('Unknown native output identity')
         owned = {screen['connector'] for screen in self.screens.values()}
         if not set(names) <= owned:
-            # UU also replays the saved physical layout, and it saves that
-            # layout before the virtual output exists. Such a request never
-            # touches the virtual screens: treat it as a no-op instead of
-            # failing the feature that asked for it.
+            if set(names) & owned:
+                raise ValueError('Mixed physical and virtual topology is unsupported')
+            if not flags:
+                self.restore_physical()
             self._event('topology_physical_only', paths=count)
             return dict(completed=True)
         if len(set(names)) != count:
@@ -519,7 +511,7 @@ class KScreenVirtualDisplays:
         if flags:
             return dict(completed=True)
         if self.exclusive_baseline is None:
-            self.exclusive_baseline = copy.deepcopy(live)
+            self.exclusive_baseline = copy.deepcopy(raw)
             if self.recovery_path is not None:
                 from native_runtime_state import write_private
                 write_private(self.recovery_path, dict(version=1, identity=self.backend.identity(),
@@ -577,6 +569,8 @@ class KScreenVirtualDisplays:
                 self._event('topology_rejected', reason=str(error)[:200])
                 raise
         if code == 0 and not data:
+            if not self.screens and load_token(self.portal_state) is None:
+                raise RuntimeError('KDE virtual display authorization is required')
             return self.status()
         if code == 0x30c014 and len(data) == 1:
             return dict(completed=True)
@@ -686,6 +680,7 @@ class KScreenVirtualDisplays:
                 self.display_ids[item['connector']] = value
             value = self.display_ids[item['connector']]
             item['gdi_name'] = '\\\\.\\DISPLAY%d' % (value + 1)
+            item['device_path'] = '\\\\?\\DISPLAY#UURB#%s#%d' % (item['connector'], value)
         return monitors
 
     def status(self):
@@ -702,7 +697,8 @@ class KScreenVirtualDisplays:
                                 slot=screen['slot'] if screen else None,
                                 width=width, height=height,
                                 refresh=_mode_refresh(item)))
-        return dict(supported=True, exclusive=self.exclusive_baseline is not None,
+        return dict(supported=bool(self.screens) or load_token(self.portal_state) is not None,
+                    exclusive=self.exclusive_baseline is not None,
                     managed_connectors=sorted(self.managed_connectors), outputs=outputs,
                     tracks_idle=self.idle_since is not None,
                     cleanup_after_seconds=max(0, round(15 - (time.monotonic() - self.idle_since)))

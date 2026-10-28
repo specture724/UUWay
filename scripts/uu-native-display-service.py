@@ -179,12 +179,10 @@ def run(config_path):
                     else:
                         result = dict(ok=True, **guardian.request(request))
                         if op == 'inspect':
+                            decorate = getattr(virtual, 'decorate', None)
+                            if decorate is not None:
+                                decorate(result['monitors'])
                             result['virtual_displays'] = virtual.status()
-                            note = getattr(virtual, 'note_monitors', None)
-                            if note is not None:
-                                # Path ids in a later SetDisplayConfig request
-                                # index this exact list.
-                                note(result.get('monitors'))
                             # The capture broker needs the portal stream node of
                             # each owned virtual output; a portal grant cannot
                             # describe an output the portal created itself.
