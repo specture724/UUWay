@@ -414,12 +414,26 @@ def display_monitors(path):
             node = item.get('node')
             if node is not None and (type(node) is not int or not 0 < node <= 0xffffffff):
                 return []
+            if node is not None and any(type(item.get(axis)) is not int or
+                                        not 2 <= item[axis] <= 4096 or item[axis] % 2
+                                        for axis in ('width', 'height')):
+                raise ValueError('Invalid virtual screen capture dimensions')
             result.append(dict(index=index, connector=item['connector'],
                                gdi_name=item['gdi_name'], virtual=bool(item.get('virtual')),
-                               node=node, x=item.get('x', 0), y=item.get('y', 0)))
+                               node=node, width=item.get('width'), height=item.get('height'),
+                               x=item.get('x', 0), y=item.get('y', 0)))
         return result
     except (OSError, ValueError, json.JSONDecodeError):
         return []
+
+
+def producer_environment(monitor):
+    environment = dict(os.environ)
+    environment.pop('UURB_CAPTURE_SIZE', None)
+    if monitor is not None and monitor.get('node') is not None:
+        # KWin 虚拟输出会采用 PipeWire 协商的尺寸，必须明确请求显示器的实际尺寸。
+        environment['UURB_CAPTURE_SIZE'] = '%dx%d' % (monitor['width'], monitor['height'])
+    return environment
 
 
 def resolve_monitor(monitors, device):
@@ -677,7 +691,7 @@ def run(path, restore_state, duration=3600, cursor_mode='embedded', cursor_path=
             producer = subprocess.Popen(producer_command(restore_state, connection.fileno(), duration,
                 track_cursor_mode, None if track_cursor_mode != cursor_mode else cursor_fd,
                 status_channel.writer.fileno(), capture_binary, connector, node), pass_fds=inherited,
-                stdout=log, stderr=log, start_new_session=True)
+                stdout=log, stderr=log, start_new_session=True, env=producer_environment(monitor))
             status_channel.writer.close()
             event('capture_started', generation=generation, cursor_mode=cursor_mode, screen_id=requested)
     finally:
@@ -941,7 +955,8 @@ def run_multi(path, restore_state, duration=3600, cursor_mode='embedded', cursor
             try:
                 producer = subprocess.Popen(producer_command(restore_state, candidate.fileno(), duration,
                     track_cursor_mode, cursor_fd, status_channel.writer.fileno(), capture_binary, connector, node),
-                    pass_fds=inherited, stdout=log, stderr=log, start_new_session=True)
+                    pass_fds=inherited, stdout=log, stderr=log, start_new_session=True,
+                    env=producer_environment(monitor))
             except Exception:
                 status_channel.close()
                 log.close()

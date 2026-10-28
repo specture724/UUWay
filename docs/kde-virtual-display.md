@@ -24,6 +24,8 @@ then make the only active one. On GNOME UUWay creates a Mutter
    restore for an output the portal itself created.
    Windows display names and device paths are assigned by connector and stay
    stable when physical outputs disappear from the active monitor list.
+   The broker requests the monitor's actual size through `UURB_CAPTURE_SIZE`
+   so PipeWire negotiates frames matching the Windows display configuration.
 4. UU's `SetDisplayConfig` arrives as the internal `0x55520001` topology
    request. When it selects the virtual output the module enables and positions
    it at the origin, makes it primary, and only then disables the physical
@@ -65,7 +67,10 @@ dimensions must match the mode UU submits when entering its virtual topology.
 
 * Virtual output creation, placement, exclusive switch (physical panel dark,
   desktop on the virtual output) and restore all work on Plasma 6.8 / KWin 6.8.
-* `uuway doctor` reports no failures with the new backend.
-* End-to-end remote verification is still open: after the exclusive switch UU's
-  own capture of the virtual screen did not start (the remote client stayed
-  black and the server exited), so the capture/owner hand-off needs more work.
+* Independent 2560×1440 capture delivers DMA-BUF frames and imports every
+  captured frame into Vulkan without mapping pixels to the CPU.
+* Without a saved authorization, IDD discovery is rejected while physical
+  display inspection remains available.
+* Remote-client validation must confirm continuous video and input during
+  exclusive mode, physical output restoration on exit, and both privacy-screen
+  and display-off controls.

@@ -176,7 +176,7 @@ class _Portal:
         token = load_token(restore_path) if restore_path is not None else None
         if not interactive and token is None:
             raise RuntimeError('Run %s before enabling virtual displays' % AUTHORIZATION_SCRIPT)
-        timeout = 120 if interactive else 2
+        timeout = 300 if interactive else 2
         self.register()
         values = self.request('CreateSession', '(a{sv})', (),
                               {'session_handle_token': self.GLib.Variant('s', 'uurb_' + secrets.token_hex(12))},
